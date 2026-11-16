@@ -378,12 +378,13 @@ function parseDef(line, nextLine) {
 // ---------- refs pre-pass ----------
 // Strip quote '>' and list prefixes repeatedly (refs pre-pass only).
 function stripPrefixes(line) {
-  let s = line;
+  let s = line, qd = 0;
   for (let k = 0; k < 8; k++) {
     const [col, ci] = indentInfo(s);
-    if (col > 3) return s;
+    if (col > 3) return [s, qd];
     const first = s.charCodeAt(ci);
     if (first === 62) {
+      qd++;
       let j = ci + 1;
       if (s.charCodeAt(j) === 32) j++;
       else if (s.charCodeAt(j) === 9) {
@@ -396,9 +397,9 @@ function stripPrefixes(line) {
     }
     const m = matchListMarker(s, ci, col);
     if (m) { s = m.length > 5 ? m[5] : s.slice(m[4]); continue; }
-    return s;
+    return [s, qd];
   }
-  return s;
+  return [s, qd];
 }
 
 // A stripped line starts a block (so a def may follow it), or is blank.
@@ -417,25 +418,65 @@ function prevAllowsDef(prev) {
   return false;
 }
 
+// Content indent of the list item enclosing line i, or -1. The opener line
+// itself may carry the marker; otherwise the nearest marker above owns it
+// only if every line between belongs to the item (indent >= cCol).
+function enclosingItemCol(lines, i) {
+  const s0 = stripQuoteLevels(lines[i]);
+  const [c0, ci0] = indentInfo(s0);
+  if (c0 <= 3) {
+    const m0 = matchListMarker(s0, ci0, c0);
+    if (m0) return m0[3];
+  }
+  const opCol = indentInfo(lines[i])[0];
+  for (let k = i - 1; k >= Math.max(0, i - 40); k--) {
+    if (isBlank(lines[k])) continue;
+    const sq = stripQuoteLevels(lines[k]);
+    const [c2, ci2] = indentInfo(sq);
+    if (c2 > 3) continue;
+    const m = matchListMarker(sq, ci2, c2);
+    if (!m) continue;
+    const cCol = m[3];
+    if (opCol < cCol) return -1;
+    for (let t = k + 1; t < i; t++) {
+      if (isBlank(lines[t])) continue;
+      if (indentInfo(lines[t])[0] < cCol) return -1;
+    }
+    return cCol;
+  }
+  return -1;
+}
+
 // Collect link reference definitions from the whole document first: marked
 // resolves forward references, so defs must be known before rendering.
 function collectRefs(lines) {
   const refs = new Map();
   const stripped = new Array(lines.length);
-  for (let k = 0; k < lines.length; k++) stripped[k] = stripPrefixes(lines[k]);
-  let fenceCh = 0, fenceLen = 0, skipUntil = -1;
+  const qdepth = new Array(lines.length);
+  for (let k = 0; k < lines.length; k++) {
+    const [s, qd] = stripPrefixes(lines[k]);
+    stripped[k] = s; qdepth[k] = qd;
+  }
+  let fenceCh = 0, fenceLen = 0, fenceDepth = 0, skipUntil = -1;
   for (let i = 0; i < lines.length; i++) {
     const s = stripped[i];
     if (fenceCh) {
-      const [col, ci] = indentInfo(s);
-      if (col <= 3 && s.charCodeAt(ci) === fenceCh) {
-        let n = 0, j = ci;
-        while (s.charCodeAt(j) === fenceCh) { n++; j++; }
-        let ok = n >= fenceLen;
-        while (ok && j < s.length) { const c = s.charCodeAt(j); if (c !== 32 && c !== 9) ok = false; j++; }
-        if (ok) fenceCh = 0;
-      }
-      continue;
+      if (isBlank(s)) continue;
+      if (qdepth[i] < fenceDepth) {
+        // line left the fence's container: fence ends unclosed; the line
+        // itself is processed normally below
+        fenceCh = 0;
+      } else if (qdepth[i] === fenceDepth) {
+        const [col, ci] = indentInfo(s);
+        if (col <= 3 && s.charCodeAt(ci) === fenceCh) {
+          let n = 0, j = ci;
+          while (s.charCodeAt(j) === fenceCh) { n++; j++; }
+          let ok = n >= fenceLen;
+          while (ok && j < s.length) { const c = s.charCodeAt(j); if (c !== 32 && c !== 9) ok = false; j++; }
+          if (ok) { fenceCh = 0; continue; }
+        }
+        continue;
+      } else continue; // deeper container: fence content
     }
     const [col, ci] = indentInfo(s);
     if (col <= 3) {
@@ -443,7 +484,19 @@ function collectRefs(lines) {
       if (c === 96 || c === 126) {
         let n = 0, j = ci;
         while (s.charCodeAt(j) === c) { n++; j++; }
-        if (n >= 3 && (c === 126 || s.indexOf('`', j) < 0)) { fenceCh = c; fenceLen = n; continue; }
+        if (n >= 3 && (c === 126 || s.indexOf('`', j) < 0)) {
+          // A fence inside a list item whose next content line is dedented
+          // below the item is empty (marked): the item ends at once and a
+          // later closer line becomes a fresh fence. Don't enter fence mode.
+          let empty = false;
+          const cCol = enclosingItemCol(lines, i);
+          if (cCol >= 0) {
+            let j2 = i + 1;
+            while (j2 < lines.length && isBlank(lines[j2])) j2++;
+            if (j2 < lines.length && indentInfo(lines[j2])[0] < cCol) empty = true;
+          }
+          if (!empty) { fenceCh = c; fenceLen = n; fenceDepth = qdepth[i]; continue; }
+        }
       }
     }
     if (i < skipUntil) continue;
@@ -1382,6 +1435,15 @@ function spanUrl(toks, ti, ext0) {
       k++;
       continue;
     }
+    if (typeof tk === 'object' && tk.t === 3) {
+      // hard break (backslash + newline): marked's greedy URL swallows the
+      // backslash, so the URL takes '\' and the newline stays a soft break.
+      // The URL cannot continue past the newline.
+      segs.push([1, tk]);
+      ext += '\\';
+      k++;
+      break;
+    }
     break;
   }
   if (segs.length === 0) return null;
@@ -1392,6 +1454,11 @@ function spanUrl(toks, ti, ext0) {
   const lits = [];
   for (let si = 0; si < segs.length; si++) {
     const [len, tk] = segs[si];
+    if (typeof tk === 'object' && tk.t === 3) {
+      // backslash inside the URL: the hard break becomes a soft newline
+      if (rem >= 1) { tail = '\n'; rem = 0; }
+      break;
+    }
     if (rem >= len) { drop++; rem -= len; continue; }
     if (rem > 0) {
       if (typeof tk === 'string') tail = tk.slice(rem);
