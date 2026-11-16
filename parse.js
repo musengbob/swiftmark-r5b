@@ -565,10 +565,15 @@ function parseHtmlBlock(lines, i, e, top) {
     for (; j < e; j++) {
       if (lines[j].toLowerCase().indexOf(needle) >= 0) { j++; break; }
     }
-    // trailing newline kept iff a non-blank line follows, or (top level
-    // only) the block ends at the final '' (the document's trailing newline)
+    // trailing newline kept unless a blank line follows (probe2g2:
+    // html-para and html-eof both end with \n; only a following blank
+    // line drops it). A TAB-only line is NOT blank for this rule — like
+    // the table rule, marked treats tab lines as content (doc-15: -->
+    // followed by a tab-only line keeps the \n). Covers a block ending
+    // at the end of a quote/list inner array (doc-19) as well as EOF.
     const text = lines.slice(i, j).join('\n');
-    return [j < e && (!isBlank(lines[j]) || (top && j === e - 1 && lines[j] === '')) ? text + '\n' : text, j];
+    const nextBlank = j < e && isBlank(lines[j]) && lines[j].indexOf('\t') < 0;
+    return [j < e && (!nextBlank || (top && j === e - 1 && lines[j] === '')) ? text + '\n' : text, j];
   }
   for (; j < e; j++) {
     if (isBlank(lines[j])) break;
@@ -992,9 +997,13 @@ function parseTable(L, i, e, out, refs) {
   while (j < e) {
     const line = L[j];
     if (line.length === 0) break;
-    // a whitespace-only line is an all-empty row in marked (verified:
-    // doc-26/doc-33 tab lines); only a truly empty line ends the table
-    if (isBlank(line)) { rows.push(splitCells('', ncols)); j++; continue; }
+    // whitespace-only line: ends the table UNLESS it contains a tab
+    // (marked: tab-only line is an all-empty row, table continues;
+    // spaces-only line ends the table like an empty line — probe2g1)
+    if (isBlank(line)) {
+      if (line.indexOf('\t') < 0) break;
+      rows.push(splitCells('', ncols)); j++; continue;
+    }
     const [ind, ci] = indentInfo(line);
     if (ind >= 4) break;
     const ch = line.charCodeAt(ci);
@@ -1406,10 +1415,11 @@ function spanUrl(toks, ti, ext0) {
 // URL matches may span following delimiter/escape/text tokens (marked's
 // greedy tail swallows `*` etc.); email local parts may span preceding
 // delimiter tokens (`_foo@bar.com`).
-function linkifyTokens(toks) {
+function linkifyTokens(toks, gated) {
   for (let ti = 0; ti < toks.length; ti++) {
     const t = toks[ti];
     if (typeof t !== 'string') continue;
+    if (gated && gated.has(ti)) continue; // scanned while inside <a>
     const s = t;
     let prevChar = '';
     if (ti > 0) {
@@ -1564,10 +1574,16 @@ function isPunctCh(c) {
 let DOC_IN_LINK = false;
 
 function inlineTokens(src, refs, inLink) {
+  // marked's inLink is per-block inline-lexing state: an unclosed <a> in
+  // one paragraph does NOT suppress autolinks in later paragraphs
+  // (probe2g3: marked links www after an unclosed-<a> paragraph; doc-31
+  // regressed when the flag leaked across paragraphs). Reset per call.
+  if (!inLink) DOC_IN_LINK = false;
   const toks = [];
+  const gated = new Set();
   const n = src.length;
   let i = 0, start = 0;
-  const flush = (to) => { if (to > start) toks.push(src.slice(start, to)); };
+  const flush = (to) => { if (to > start) { if (DOC_IN_LINK) gated.add(toks.length); toks.push(src.slice(start, to)); } };
   while (i < n) {
     const cc = src.charCodeAt(i);
     if (cc === 92) { // backslash
@@ -1665,11 +1681,14 @@ function inlineTokens(src, refs, inLink) {
       }
       const H = tryHtml(src, i);
       if (H) {
+        // flush BEFORE toggling: the text before this tag was scanned
+        // under the pre-tag flag state (doc-31: a URL before <a> must
+        // link; toggling first gated it wrongly).
+        flush(i);
         if (!inLink) {
           if (/^<a[\s>]/i.test(H.s)) DOC_IN_LINK = true;
           else if (/^<\/a[\s>]/i.test(H.s)) DOC_IN_LINK = false;
         }
-        flush(i);
         toks.push({ t: 9, s: H.s });
         i = H.end; start = i; continue;
       }
@@ -1687,8 +1706,12 @@ function inlineTokens(src, refs, inLink) {
     i++;
   }
   flush(n);
-  // marked gates its bare-URL/email tokenizer on !state.inLink
-  if (!inLink && !DOC_IN_LINK) linkifyTokens(toks);
+  // marked gates its bare-URL/email tokenizer on !state.inLink AT EACH
+  // POSITION: an <a> opening mid-paragraph suppresses only autolinks
+  // after it, and a </a> re-enables them (doc-33: flag set by an early
+  // <a />, cleared by a later </a> in the www paragraph — end-of-scan
+  // gating linked www wrongly). Gate per text segment, not at end.
+  if (!inLink) linkifyTokens(toks, gated);
   processEm(toks);
   return toks;
 }
