@@ -580,7 +580,7 @@ function parseHtmlBlock(lines, i, e, top) {
 // ---------- block parser ----------
 // lazy: null, or a boolean array (same indexing as lines) marking lazy
 // continuation lines, which never count as setext underlines or table rows.
-function parseBlocks(L, s, e, out, refs, tight, lazy, looseOut, top) {
+function parseBlocks(L, s, e, out, refs, tight, lazy, looseOut, top, inItem) {
   let i = s, prevBlock = false, prevDef = false, sawBlank = false;
   while (i < e) {
     const line = L[i];
@@ -620,13 +620,15 @@ function parseBlocks(L, s, e, out, refs, tight, lazy, looseOut, top) {
       const al = matchDelimRow(L[i + 1]);
       if (al && countCells(line) === al.length) { i = parseTable(L, i, e, out, refs); continue; }
     }
-    i = parseParagraph(L, i, e, out, refs, tight, lazy);
+    i = parseParagraph(L, i, e, out, refs, tight, lazy, inItem);
   }
   return i;
 }
 
 // Does line j start a block that interrupts a paragraph? (def/html7/code no)
-function interruptsPara(L, j, e) {
+// inItem: inside list-item content marked lexes with top=false, so an
+// ordered list with ANY start number interrupts (verified by probe).
+function interruptsPara(L, j, e, inItem) {
   const line = L[j];
   if (isBlank(line)) return true;
   const [ind, ci] = indentInfo(line);
@@ -643,7 +645,7 @@ function interruptsPara(L, j, e) {
   }
   if (ch >= 48 && ch <= 57) {
     const m = matchListMarker(line, ci, ind);
-    return m !== null && m[2] === 1 && m[4] < line.length;
+    return m !== null && (inItem || m[2] === 1) && m[4] < line.length;
   }
   if (ch === 60) {
     const k = htmlBlockKind(line, ci)[0];
@@ -652,7 +654,7 @@ function interruptsPara(L, j, e) {
   return false;
 }
 
-function parseParagraph(L, i, e, out, refs, tight, lazy) {
+function parseParagraph(L, i, e, out, refs, tight, lazy, inItem) {
   let j = i + 1;
   while (j < e) {
     const line = L[j];
@@ -663,7 +665,7 @@ function parseParagraph(L, i, e, out, refs, tight, lazy) {
     // delimiter row (even a pipe-less header); the table itself then fails
     // and the lines become a new paragraph. A plain ---/=== row is setext.
     if (ind <= 3 && j + 1 < e && matchDelimRow(L[j + 1]) && (L[j + 1].indexOf('|') >= 0 || L[j + 1].indexOf(':') >= 0) && !(lazy && (lazy[j] || lazy[j + 1]))) break;
-    if (interruptsPara(L, j, e) && !(lazy && lazy[j])) break;
+    if (interruptsPara(L, j, e, inItem) && !(lazy && lazy[j])) break;
     j++;
   }
   const text = L.slice(i, j).join('\n');
@@ -867,7 +869,7 @@ function parseQuote(L, i, e, out, refs) {
   // block at the end still sees the document's trailing newline
   if (j < e && isBlank(L[j])) { inner.push(''); lazy.push(false); }
   const sub = [];
-  parseBlocks(inner, 0, inner.length, sub, refs, false, lazy);
+  parseBlocks(inner, 0, inner.length, sub, refs, false, lazy, null, undefined, false);
   out.push('<blockquote>\n' + sub.join('') + '</blockquote>\n');
   return j;
 }
@@ -926,7 +928,7 @@ function parseList(L, i, e, out, refs, first) {
         continue;
       }
       // lazy continuation of the item's paragraph
-      if (lastInnerIsPara(content) && !interruptsPara(L, j, e) && parseDef(ln, null) === null) {
+      if (lastInnerIsPara(content) && !interruptsPara(L, j, e, true) && parseDef(ln, null) === null) {
         content.push(ln.replace(/^[ \t]+/, ''));
         lazy.push(true);
         j++;
@@ -956,14 +958,14 @@ function parseList(L, i, e, out, refs, first) {
     }
     const lo = { loose: false };
     const sub = [];
-    parseBlocks(content, 0, content.length, sub, refs, true, lazy, lo);
+    parseBlocks(content, 0, content.length, sub, refs, true, lazy, lo, undefined, true);
     if (lo.loose) loose = true;
     rendered.push([sub, task]);
   }
   if (loose) {
     for (let q = 0; q < items.length; q++) {
       const sub = [];
-      parseBlocks(items[q][0], 0, items[q][0].length, sub, refs, false, items[q][1], null);
+      parseBlocks(items[q][0], 0, items[q][0].length, sub, refs, false, items[q][1], null, undefined, true);
       rendered[q][0] = sub;
     }
   }
@@ -989,7 +991,10 @@ function parseTable(L, i, e, out, refs) {
   const rows = [];
   while (j < e) {
     const line = L[j];
-    if (isBlank(line)) break;
+    if (line.length === 0) break;
+    // a whitespace-only line is an all-empty row in marked (verified:
+    // doc-26/doc-33 tab lines); only a truly empty line ends the table
+    if (isBlank(line)) { rows.push(splitCells('', ncols)); j++; continue; }
     const [ind, ci] = indentInfo(line);
     if (ind >= 4) break;
     const ch = line.charCodeAt(ci);
@@ -1170,7 +1175,7 @@ function parseInlineDest(src, i) {
 // Build a link/image result from raw text + href/title. Links are
 // rejected when the text contains a nested bracket link; images are not.
 function makeLink(text, href, title, end, refs, img) {
-  const kids = inlineTokens(text, refs);
+  const kids = inlineTokens(text, refs, true);
   if (!img && kidsContainLink(kids)) return null;
   return { end, href, title, kids };
 }
@@ -1279,7 +1284,7 @@ function tryHtml(src, i) {
 
 // Try strikethrough at src[i] === '~'. The closing run must have EXACTLY
 // the opening run's length; content must start/end with a non-space char.
-function tryDel(src, i, refs) {
+function tryDel(src, i, refs, inLink) {
   let m = 1;
   while (src.charCodeAt(i + m) === 126) m++;
   if (m > 2) return null; // opening run is at most ~~
@@ -1293,7 +1298,7 @@ function tryDel(src, i, refs) {
     let r = 1;
     while (src.charCodeAt(b + r) === 126) r++;
     if (r === m && !isSpaceCh(src[b - 1])) {
-      return { kids: inlineTokens(src.slice(i + m, b), refs), end: b + m };
+      return { kids: inlineTokens(src.slice(i + m, b), refs, inLink), end: b + m };
     }
     j = b + r;
   }
@@ -1470,10 +1475,21 @@ function linkifyTokens(toks) {
       EMAIL_STICKY.lastIndex = ls;
       const m = EMAIL_STICKY.exec(s);
       if (!m || m.index + m[0].length <= idx) { pos = idx + 1; continue; }
-      // the lookahead char may live in the next token (a `_` delimiter run)
+      // the lookahead char may live in the next token (a `_` delimiter run).
+      // But marked tokenizes emphasis first: if that `_` closes an earlier
+      // `_` opener, the email sits inside <em> and IS linked (doc-31/38).
+      // Allow the link when the nearest preceding `_` delimiter is an
+      // opener-only run; otherwise keep rejecting (a@b.com_ with no opener).
       if (m.index + m[0].length === s.length && ti + 1 < toks.length) {
         const nx = toks[ti + 1];
-        if (typeof nx === 'object' && nx.t === 1 && nx.c === '_') { pos = idx + 1; continue; }
+        if (typeof nx === 'object' && nx.t === 1 && nx.c === '_') {
+          let allow = false;
+          for (let k = ti - 1; k >= 0; k--) {
+            const pk = toks[k];
+            if (typeof pk === 'object' && pk.t === 1 && pk.c === '_') { allow = pk.o && !pk.cl; break; }
+          }
+          if (!allow) { pos = idx + 1; continue; }
+        }
       }
       let pre = '';
       if (m.index === emitFrom && emitFrom === 0) {
@@ -1541,7 +1557,13 @@ function isPunctCh(c) {
   return PUNCT_RE.test(c);
 }
 
-function inlineTokens(src, refs) {
+// marked's lexer.state.inLink: bare URL/email autolinks are suppressed
+// inside link text, and an unclosed inline <a> tag leaves inLink set for
+// the rest of the document (deferred inline queue, doc order). Reset per
+// parse(); nested link-text tokenization must not leak tag toggles out.
+let DOC_IN_LINK = false;
+
+function inlineTokens(src, refs, inLink) {
   const toks = [];
   const n = src.length;
   let i = 0, start = 0;
@@ -1643,6 +1665,10 @@ function inlineTokens(src, refs) {
       }
       const H = tryHtml(src, i);
       if (H) {
+        if (!inLink) {
+          if (/^<a[\s>]/i.test(H.s)) DOC_IN_LINK = true;
+          else if (/^<\/a[\s>]/i.test(H.s)) DOC_IN_LINK = false;
+        }
         flush(i);
         toks.push({ t: 9, s: H.s });
         i = H.end; start = i; continue;
@@ -1650,7 +1676,7 @@ function inlineTokens(src, refs) {
       i++; continue;
     }
     if (cc === 126) { // '~' — strikethrough
-      const D = tryDel(src, i, refs);
+      const D = tryDel(src, i, refs, inLink);
       if (D) {
         flush(i);
         toks.push({ t: 8, kids: D.kids });
@@ -1661,7 +1687,8 @@ function inlineTokens(src, refs) {
     i++;
   }
   flush(n);
-  linkifyTokens(toks);
+  // marked gates its bare-URL/email tokenizer on !state.inLink
+  if (!inLink && !DOC_IN_LINK) linkifyTokens(toks);
   processEm(toks);
   return toks;
 }
@@ -1751,6 +1778,7 @@ function renderInline(toks) {
 
 // ---------- entry point ----------
 export function parse(markdown) {
+  DOC_IN_LINK = false;
   const src = markdown.replace(/\r\n|\r/g, '\n');
   const lines = src.split('\n');
   const refs = collectRefs(lines);
