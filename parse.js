@@ -1719,7 +1719,7 @@ function linkifyTokens(toks, gated) {
         }
         if (start > emitFrom) segs.push(s.slice(emitFrom, start));
         const href = kind === 1 ? procHref('http://' + url) : procHref(url);
-        segs.push({ t: 10, href, text: url });
+        segs.push({ t: 10, href, text: url, bare: 1 });
         pos = emitFrom = endPos;
         curPrev = ''; found = true;
         continue;
@@ -1780,7 +1780,7 @@ function linkifyTokens(toks, gated) {
       const email = pre + m[0];
       const full = scheme + email + path;
       const href = scheme === 'xmpp:' ? 'xmpp:' + email + path : 'mailto:' + email;
-      segs.push({ t: 10, href: procHref(href), text: full });
+      segs.push({ t: 10, href: procHref(href), text: full, bare: 1 });
       pos = emitFrom = m.index + m[0].length + path.length;
       curPrev = ''; found = true;
     }
@@ -1988,34 +1988,176 @@ function inline(src, refs) {
   return renderInline(inlineTokens(src, refs));
 }
 
-// CommonMark delimiter-stack emphasis, left-to-right over closers.
-function processEm(toks) {
-  let i = 0;
-  while (i < toks.length) {
-    const t = toks[i];
-    if (typeof t !== 'object' || t.t !== 1 || !t.cl || t.n <= 0) { i++; continue; }
-    let j = i - 1, matched = false;
-    while (j >= 0) {
-      const o = toks[j];
-      if (typeof o === 'object' && o.t === 1 && o.o && o.n > 0 && o.c === t.c) {
-        if ((o.o && o.cl) || (t.o && t.cl)) {
-          if ((o.n + t.n) % 3 === 0 && !(o.n % 3 === 0 && t.n % 3 === 0)) { j--; continue; }
-        }
-        const use = (o.n >= 2 && t.n >= 2) ? 2 : 1;
-        const node = { t: 5, tag: use === 2 ? 'strong' : 'em', kids: toks.slice(j + 1, i) };
-        o.n -= use; t.n -= use;
-        const rep = [];
-        if (o.n > 0) rep.push(o);
-        rep.push(node);
-        if (t.n > 0) rep.push(t);
-        toks.splice(j, i - j + 1, ...rep);
-        i = j + rep.length - 1;
-        matched = true;
-        break;
-      }
-      j--;
+// marked's emStrong scan, ported to the token list (phase 2m). It replaces
+// the CommonMark delimiter stack: marked tries each opener left to right;
+// opener-like runs ADD to the closer length it needs, ambiguous runs get
+// the rule of 3, and surplus closer chars land INSIDE the node (P10).
+// Runs are classified from their original neighbours (pv/nx, recomputed
+// per call); recursion into node kids recomputes them for the inner text,
+// as marked re-tokenizes it. GFM rules: LDelim lt, RDelimAst ht, RDelimUnd
+// kt (no intraword _ group); ~ counts as non-punct for the * scan only.
+function rawFirstTok(t) {
+  if (typeof t === 'string') return t.charAt(0);
+  switch (t.t) {
+    case 0: return '\\';
+    case 1: return t.c;
+    case 2: return '`';
+    case 3: return t.bs ? '\\' : ' ';
+    case 5: return t.c || '*';
+    case 6: return '[';
+    case 7: return '!';
+    case 8: return '~';
+    default: return t.bare ? t.text.charAt(0) : '<';
+  }
+}
+function rawLastTok(t) {
+  if (typeof t === 'string') return t.charAt(t.length - 1);
+  switch (t.t) {
+    case 0: return t.s;
+    case 1: return t.c;
+    case 2: return '`';
+    case 3: return '\n';
+    case 5: return t.c || '*';
+    case 6: case 7: return ')';
+    case 8: return '~';
+    default: return t.bare ? t.text.charAt(t.text.length - 1) : '>';
+  }
+}
+const ALNUM_RE = /[\p{L}\p{N}]/u;
+function isAlnumCh(c) {
+  if (c === '') return false;
+  const cc = c.charCodeAt(0);
+  if (cc < 128) return (cc >= 48 && cc <= 57) || (cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122);
+  return ALNUM_RE.test(c);
+}
+function isPunctAst(c) { return c !== '~' && isPunctCh(c); }
+// marked's emStrongRDelim groups: 1/2 pure closer, 3/4 opener-like,
+// 5/6 ambiguous, 0 no match (run is skipped by the scan).
+function classifyRun(prev, next, ch) {
+  const punct = ch === '*' ? isPunctAst : isPunctCh;
+  const pP = punct(prev), pS = isSpaceCh(prev);
+  const nP = punct(next), nS = isSpaceCh(next);
+  const pNP = !pP && !pS, nNP = !nP && !nS;
+  if (pP && nS) return 1;
+  if (pNP && (nP || nS)) return 2;
+  if ((pP || pS) && nNP) return 3;
+  if (pS && nP) return 4;
+  if (pP && nP) return 5;
+  if (ch === '*' && pNP && nNP) return 6;
+  return 0;
+}
+// marked's RDelim skip alternative: at scan start, a lone * between two
+// __ runs (or a lone _ between two **) is consumed, not classified.
+// Returns the token index to skip, or -1.
+function findSkipRun(toks, j, ch) {
+  const other = ch === '*' ? '_' : '*';
+  let i = j + 1;
+  const transparent = (t) => {
+    if (typeof t === 'string') return !t.includes('*') && !t.includes('_');
+    if (t.t === 0 || t.t === 3 || t.t === 6 || t.t === 7) return true;
+    if (t.t === 2 || t.t === 9) return !t.s.includes('*') && !t.s.includes('_');
+    if (t.t === 10) return !t.text.includes('*') && !t.text.includes('_');
+    return false;
+  };
+  const skipText = () => { while (i < toks.length && (typeof toks[i] !== 'object' || toks[i].t !== 1)) { if (!transparent(toks[i])) return false; i++; } return true; };
+  if (!skipText() || i >= toks.length) return -1;
+  const first = toks[i];
+  if (first.c !== other || first.n !== 2) return -1;
+  i++;
+  if (!skipText() || i >= toks.length) return -1;
+  const mid = toks[i];
+  if (mid.c !== ch || mid.n !== 1) return -1;
+  const midIdx = i;
+  i++;
+  if (!skipText() || i >= toks.length) return -1;
+  const last = toks[i];
+  if (last.c !== other || last.n < 2) return -1;
+  return midIdx;
+}
+function scanCloser(toks, j, ch, kk, y, R, o, skipIdx) {
+  let m = kk, f = 0;
+  for (let i = j + 1; i < toks.length; i++) {
+    if (i === skipIdx) continue;
+    const r = toks[i];
+    if (typeof r !== 'object' || r.t !== 1 || r.c !== ch || r.n <= 0) continue;
+    const b = r.n;
+    const g = classifyRun(r.pv, r.nx, ch);
+    if (g === 0) continue;
+    if (g === 3 || g === 4) { m += b; continue; }
+    if (g === 5 || g === 6 || R) {
+      if (o && (g === 5 || g === 6)) return null;
+      if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
     }
-    if (!matched) i++;
+    m -= b;
+    if (m > 0) continue;
+    const bConsumed = Math.min(b, b + m + f);
+    const use = Math.min(kk, bConsumed) % 2 === 1 ? 1 : 2;
+    return { idx: i, bConsumed, use };
+  }
+  return null;
+}
+function processEm(toks) {
+  const n = toks.length;
+  for (let i = 0; i < n; i++) {
+    const t = toks[i];
+    if (typeof t === 'object' && t.t === 1) {
+      t.pv = i > 0 ? rawLastTok(toks[i - 1]) : '';
+      t.nx = i + 1 < n ? rawFirstTok(toks[i + 1]) : '';
+      t.pp = t.pv;
+      t.y = t.n;
+    }
+  }
+  let j = 0;
+  while (j < toks.length) {
+    const t = toks[j];
+    if (typeof t !== 'object' || t.t !== 1 || t.n <= 0) { j++; continue; }
+    const ch = t.c, k = t.n;
+    let prevChar = '';
+    if (j > 0 && typeof toks[j - 1] === 'string') {
+      const s = toks[j - 1];
+      if (s.charAt(s.length - 1) !== '_') prevChar = s.charAt(s.length - 1);
+    }
+    const p = t.pp;
+    const after = t.nx;
+    // LDelim: the run must be followed by a punct or non-space char.
+    if (after === '' || isSpaceCh(after)) { j++; continue; }
+    const d = isPunctAst(after);
+    // marked's punctuation rule nt = space-or-punct except * and _: u is
+    // true for a space prevChar (doc-10/12/20 regressions); h covers
+    // space too (p is * or _ or nt).
+    const h = isSpaceCh(p) || isPunctCh(p);
+    const R = p !== '' && p.trim() !== '' && (d || (ch === '*' && !h));
+    const s4 = ch === '_' && !d && after !== '_';
+    const skipIdx = findSkipRun(toks, j, ch);
+    let hit = null, kkUsed = 0;
+    for (let kk = k; kk >= 1; kk--) {
+      const retry = kk < k;
+      const nn = retry ? p : prevChar;
+      const u = retry ? h : (nn !== '*' && nn !== '_' && (isSpaceCh(nn) || isPunctCh(nn)));
+      if (s4 && isAlnumCh(nn)) continue;
+      if (d && nn !== '' && !u) continue;
+      hit = scanCloser(toks, j, ch, kk, k, R, retry, skipIdx);
+      if (hit) { kkUsed = kk; break; }
+    }
+    if (!hit) { j++; continue; }
+    const i = hit.idx, bConsumed = hit.bConsumed, use = hit.use;
+    const closer = toks[i];
+    const b = closer.n;
+    const kids = [];
+    if (kkUsed > use) kids.push({ t: 1, c: ch, n: kkUsed - use, o: true, cl: true });
+    for (let q = j + 1; q < i; q++) kids.push(toks[q]);
+    if (bConsumed > use) kids.push({ t: 1, c: ch, n: bConsumed - use, o: true, cl: true });
+    processEm(kids);
+    const node = { t: 5, tag: use === 2 ? 'strong' : 'em', c: ch, kids };
+    const rep = [];
+    if (k > kkUsed) rep.push(ch.repeat(k - kkUsed));
+    rep.push(node);
+    if (b > bConsumed) {
+      rep.push({ t: 1, c: ch, n: b - bConsumed, o: true, cl: true, pv: ch, nx: closer.nx, pp: closer.pp, y: b });
+    }
+    toks.splice(j, i - j + 1, ...rep);
+    j += rep.length;
+    if (b > bConsumed) j--; // leftover closer is lexed fresh: try it as opener
   }
 }
 
