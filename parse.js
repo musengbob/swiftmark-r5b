@@ -964,16 +964,46 @@ function lastInnerDirectPara(lines, lazy) {
   let k = lines.length - 1;
   while (k >= 0 && isBlank(lines[k])) k--;
   if (k < 0) return false;
+  // The last line itself may start the nested container: a list-marker or
+  // quote line as the last content line means the open paragraph lives
+  // inside that nested item/quote, not directly here — the walk below
+  // only inspects lines BEFORE the run start, so it misses this case
+  // (doc-20/doc-29: code-merge fired after a marker line, leaving
+  // residual spaces that survived as lazy lines). Lazy lines are
+  // paragraph text of this container, so they don't count.
+  if (!(lazy && lazy[k])) {
+    const [indk, cik] = indentInfo(lines[k]);
+    if (indk <= 3 && (lines[k].charCodeAt(cik) === 62 || matchListMarker(lines[k], cik, indk))) return false;
+  }
   let start = k;
+  let crossedBlank = false;
   while (start > 0) {
     const prev = lines[start - 1];
-    if (isBlank(prev)) break;
+    if (isBlank(prev)) { crossedBlank = true; start--; continue; }
     if (lazy && lazy[start - 1]) { start--; continue; }
     const [ind, ci] = indentInfo(prev);
     if (ind <= 3) {
       const ch = prev.charCodeAt(ci);
-      if (ch === 62) return false; // quote line: para lives in a quote
-      if (matchListMarker(prev, ci, ind)) return false; // nested list item
+      if (ch === 62) {
+        if (!crossedBlank) return false; // quote line: para lives in a quote
+        break; // a blank separates the run from the quote: direct
+      }
+      const mm = matchListMarker(prev, ci, ind);
+      if (mm) {
+        if (!crossedBlank) return false; // nested list item
+        // Blank-separated (doc-28): nested only if the marker's item
+        // owns the whole span from the marker to the run end — every
+        // line blank, lazy, or indented >= the item's content column.
+        // Otherwise the run is a direct paragraph of this container.
+        const mc = mm[3];
+        let owns = true;
+        for (let q = start; q <= k; q++) {
+          if (isBlank(lines[q]) || (lazy && lazy[q])) continue;
+          if (indentInfo(lines[q])[0] < mc) { owns = false; break; }
+        }
+        if (owns) return false;
+        break;
+      }
       if (ch === 35 && matchATX(prev, ci)) break;
       if ((ch === 96 || ch === 126) && matchFence(prev, ci)) break;
       if (isHR(prev, ci)) break;
