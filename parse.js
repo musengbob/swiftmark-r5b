@@ -194,6 +194,16 @@ function stripIndent(line, n) {
   return stripFrom(line, 0, 0, n);
 }
 
+// Like stripIndent, but a tab starting exactly at the strip boundary expands
+// to spaces (marked expands tabs when list indentation is stripped: the tab
+// sits at original column n, so its width is 4 - (n % 4)). Fenced-code and
+// indented-code strips do NOT expand (marked keeps a raw tab there).
+function stripIndentTab(line, n) {
+  const s = stripIndent(line, n);
+  if (n > 0 && s.charCodeAt(0) === 9) return ' '.repeat(4 - (n % 4)) + s.slice(1);
+  return s;
+}
+
 // ---------- list markers ----------
 // line[ci] is a list marker start, col is its column. Returns null or
 // [ordered, markerChar, number, contentCol, contentIdx].
@@ -698,7 +708,7 @@ function parseFenced(L, i, e, out, f, ind) {
   const content = [];
   for (let k = i + 1; k < j; k++) content.push(ind > 0 ? stripIndent(L[k], ind) : L[k]);
   let text = content.join('\n');
-  if (closed && content.length && content[content.length - 1] !== '') text += '\n';
+  if (content.length && content[content.length - 1] !== '') text += '\n';
   const lang = info === '' ? '' : ' class="language-' + escText(unescBS(info.split(/\s+/)[0])) + '"';
   out.push('<pre><code' + lang + '>' + escRaw(text) + '</code></pre>\n');
   return closed ? j + 1 : j;
@@ -736,7 +746,11 @@ function parseIndentedCode(L, i, e, out) {
 // ---------- blockquote ----------
 function stripQuotePrefix(line, ci, col) {
   const j = ci + 1;
-  if (line.charCodeAt(j) === 32) return line.slice(j + 1);
+  if (line.charCodeAt(j) === 32) {
+    // a tab right after '> ' expands by its original column (col+2)
+    if (line.charCodeAt(j + 1) === 9) return ' '.repeat(4 - ((col + 2) % 4)) + line.slice(j + 2);
+    return line.slice(j + 1);
+  }
   if (line.charCodeAt(j) === 9) return stripFrom(line, j, col + 1, 1);
   return line.slice(j);
 }
@@ -906,7 +920,7 @@ function parseList(L, i, e, out, refs, first) {
       if (m2 && m2[0] === ord && m2[1] === ch && ind2 < cCol) break;
       if (m2 && ind2 < cCol) break; // different marker: list ends here
       if (ind2 >= cCol) {
-        content.push(stripIndent(ln, cCol));
+        content.push(stripIndentTab(ln, cCol));
         lazy.push(false);
         j++;
         continue;
@@ -956,7 +970,9 @@ function parseList(L, i, e, out, refs, first) {
   for (const [sub, task] of rendered) {
     let body = sub.join('');
     if (task !== null) {
-      body = '<input' + (task ? ' checked=""' : '') + ' disabled="" type="checkbox"> ' + body;
+      const inp = '<input' + (task ? ' checked=""' : '') + ' disabled="" type="checkbox"> ';
+      // marked puts the checkbox INSIDE the first <p> of a loose item
+      body = body.startsWith('<p>') ? '<p>' + inp + body.slice(3) : inp + body;
     }
     out.push('<li>' + body + '</li>\n');
   }
@@ -1285,7 +1301,7 @@ function tryDel(src, i, refs) {
 }
 
 // ---------- GFM www / email autolinks (post-scan pass over text tokens) ----------
-const URL_STICKY = /(?:(?:https?|ftp):\/\/|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
+const URL_STICKY = /(?:(?:[Hh][Tt][Tt][Pp][Ss]?|[Ff][Tt][Pp]):\/\/|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
 const EMAIL_STICKY = /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![a-zA-Z0-9-_])/y;
 const EMAIL_LOCAL_CHARS = new Set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&\'*+/=?^_`{|}~-'.split(''));
 const WWW_PREV_OK = new Set([' ', '\t', '\n', '\r', '\f', '\v', '(', '*', '_', '~']);
@@ -1416,9 +1432,9 @@ function linkifyTokens(toks) {
           start = idx;
         } else {
           start = -1;
-          if (s.slice(idx - 5, idx) === 'https') start = idx - 5;
-          else if (s.slice(idx - 4, idx) === 'http') start = idx - 4;
-          else if (s.slice(idx - 3, idx) === 'ftp') start = idx - 3;
+          if (s.slice(idx - 5, idx).toLowerCase() === 'https') start = idx - 5;
+          else if (s.slice(idx - 4, idx).toLowerCase() === 'http') start = idx - 4;
+          else if (s.slice(idx - 3, idx).toLowerCase() === 'ftp') start = idx - 3;
           if (start < 0 || start < emitFrom) { pos = idx + 3; continue; }
         }
         URL_STICKY.lastIndex = start;
