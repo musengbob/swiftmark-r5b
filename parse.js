@@ -194,14 +194,25 @@ function stripIndent(line, n) {
   return stripFrom(line, 0, 0, n);
 }
 
-// Like stripIndent, but a tab starting exactly at the strip boundary expands
-// to spaces (marked expands tabs when list indentation is stripped: the tab
-// sits at original column n, so its width is 4 - (n % 4)). Fenced-code and
-// indented-code strips do NOT expand (marked keeps a raw tab there).
+// Like stripIndent, but the FULL leading whitespace run is expanded to
+// spaces from its true column before slicing (marked's J()): a tab's width
+// is fixed by its raw column, and outer strips already expanded theirs, so
+// current-string columns are exact. Expanding only the boundary tab (as
+// before) used the post-strip column and was wrong after two strips
+// (quote->list, list->list). Fenced-code and indented-code strips do NOT
+// expand (marked keeps a raw tab there) — they still use stripIndent.
 function stripIndentTab(line, n) {
-  const s = stripIndent(line, n);
-  if (n > 0 && s.charCodeAt(0) === 9) return ' '.repeat(4 - (n % 4)) + s.slice(1);
-  return s;
+  if (n <= 0) return line;
+  let col = 0, i = 0, spaces = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c === 32) { spaces++; col++; i++; }
+    else if (c === 9) { const w = 4 - (col % 4); spaces += w; col += w; i++; }
+    else break;
+  }
+  if (i === 0) return line;
+  if (spaces <= n) return line.slice(i);
+  return ' '.repeat(spaces - n) + line.slice(i);
 }
 
 // ---------- list markers ----------
@@ -805,14 +816,20 @@ function parseIndentedCode(L, i, e, out) {
 
 // ---------- blockquote ----------
 function stripQuotePrefix(line, ci, col) {
+  // Expand the whitespace run after '>' from its raw column (col+1),
+  // then drop the single optional space (marked's J() on the run).
+  // Expanding only a tab immediately after '> ' left tabs after two or
+  // more spaces raw, with the wrong column for later strips.
   const j = ci + 1;
-  if (line.charCodeAt(j) === 32) {
-    // a tab right after '> ' expands by its original column (col+2)
-    if (line.charCodeAt(j + 1) === 9) return ' '.repeat(4 - ((col + 2) % 4)) + line.slice(j + 2);
-    return line.slice(j + 1);
+  let c2 = col + 1, k = j, spaces = 0;
+  while (k < line.length) {
+    const d = line.charCodeAt(k);
+    if (d === 32) { spaces++; c2++; k++; }
+    else if (d === 9) { const w = 4 - (c2 % 4); spaces += w; c2 += w; k++; }
+    else break;
   }
-  if (line.charCodeAt(j) === 9) return stripFrom(line, j, col + 1, 1);
-  return line.slice(j);
+  if (spaces === 0) return line.slice(j);
+  return ' '.repeat(spaces - 1) + line.slice(k);
 }
 
 // Strip repeated leading quote prefixes ('> > foo' -> 'foo').
