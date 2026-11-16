@@ -1226,19 +1226,20 @@ function findCloseBracket(src, i) {
     const cc = src.charCodeAt(j);
     if (cc === 92) { j += 2; continue; }
     if (cc === 96) {
+      // marked's label regex pairs a backtick run with the NEXT backtick
+      // run of ANY length as a code-span unit (`` a ` b `` pairs the
+      // opening `` with the middle `); a run with no following run kills
+      // the label, except a run of 2+ immediately before `]`.
       let m = 1;
       while (src.charCodeAt(j + m) === 96) m++;
-      let k = j + m, found = -1;
-      while (k < n) {
-        const b = src.indexOf('`', k);
-        if (b < 0) break;
-        let r = 1;
-        while (src.charCodeAt(b + r) === 96) r++;
-        if (r === m) { found = b; break; }
-        k = b + r;
+      const b = src.indexOf('`', j + m);
+      if (b < 0) {
+        if (m >= 2 && src.charCodeAt(j + m) === 93) { j += m; continue; }
+        return -1;
       }
-      if (found >= 0) { j = found + m; continue; }
-      j += m; continue;
+      let r = 1;
+      while (src.charCodeAt(b + r) === 96) r++;
+      j = b + r; continue;
     }
     if (cc === 60) { // skip autolinks / inline HTML: `]` inside never closes
       const A = tryAutolink(src, j) || tryHtml(src, j);
@@ -1433,7 +1434,10 @@ function tryHtml(src, i) {
 }
 
 // Try strikethrough at src[i] === '~'. The closing run must have EXACTLY
-// the opening run's length; content must start/end with a non-space char.
+// the opening run's length. Like marked's delRDelim scan, opener-like
+// runs (space/punct before + plain char after, or space before + punct
+// after) nest instead of closing; space before + space/end after is
+// ignored (doc-32: ~~we ~~x~~ less~~ nests).
 function tryDel(src, i, refs, inLink) {
   let m = 1;
   while (src.charCodeAt(i + m) === 126) m++;
@@ -1441,14 +1445,25 @@ function tryDel(src, i, refs, inLink) {
   const after = src[i + m];
   if (after === undefined || isSpaceCh(after)) return null;
   const n = src.length;
-  let j = i + m + 1;
+  let depth = m, j = i + m + 1;
   while (j < n) {
     const b = src.indexOf('~', j);
     if (b < 0) return null;
     let r = 1;
     while (src.charCodeAt(b + r) === 126) r++;
-    if (r === m && !isSpaceCh(src[b - 1])) {
-      return { kids: inlineTokens(src.slice(i + m, b), refs, inLink), end: b + m };
+    if (r === m) {
+      const before = src[b - 1] ?? '', afterC = src[b + r] ?? '';
+      const bSpace = isSpaceCh(before), bPunct = isPunctCh(before);
+      const aSpace = isSpaceCh(afterC), aPunct = isPunctCh(afterC);
+      const aPlain = !aSpace && !aPunct && afterC !== '';
+      const isOpener = ((bSpace || bPunct) && aPlain) || (bSpace && aPunct);
+      if (isOpener) depth += r;
+      else if (!(bSpace && aSpace)) {
+        depth -= r;
+        if (depth <= 0) {
+          return { kids: inlineTokens(src.slice(i + m, b), refs, inLink), end: b + m };
+        }
+      }
     }
     j = b + r;
   }
@@ -1462,29 +1477,15 @@ const EMAIL_LOCAL_CHARS = new Set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRS
 const WWW_PREV_OK = new Set([' ', '\t', '\n', '\r', '\f', '\v', '(', '*', '_', '~']);
 const TRAIL_PUNCT = /[?!.,:;*_~]+$/;
 
-// Trim a greedy URL match: cut at unmatched '(', drop unbalanced
-// trailing ')', trim trailing ?!.,:;*_~ (loop until stable).
+// marked's _backpedal regex, applied until stable: a trailing ')' is kept
+// when it closes a balanced (...) group inside the URL (doc-12/37), and
+// the match ends before an unmatched '(' (doc-08).
+const BACKPEDAL_RE = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
 function backpedal(u) {
   let prev;
   do {
     prev = u;
-    u = u.replace(/&[a-zA-Z0-9]+;$/, ''); // drop trailing entity-like tail
-    let open = 0, close = 0;
-    for (let k = 0; k < u.length; k++) {
-      if (u[k] === '(') open++;
-      else if (u[k] === ')') close++;
-    }
-    if (open > close) u = u.slice(0, u.lastIndexOf('('));
-    while (u.endsWith(')')) {
-      let o = 0, c = 0;
-      for (let k = 0; k < u.length; k++) {
-        if (u[k] === '(') o++;
-        else if (u[k] === ')') c++;
-      }
-      if (c > o) u = u.slice(0, -1);
-      else break;
-    }
-    u = u.replace(TRAIL_PUNCT, '');
+    u = BACKPEDAL_RE.exec(u)?.[0] ?? '';
   } while (u !== prev);
   return u;
 }
@@ -1524,9 +1525,10 @@ function spanUrl(toks, ti, ext0) {
       continue;
     }
     if (typeof tk === 'object' && tk.t === 3) {
-      // hard break (backslash + newline): marked's greedy URL swallows the
-      // backslash, so the URL takes '\' and the newline stays a soft break.
-      // The URL cannot continue past the newline.
+      // only a BACKSLASH hard break extends the URL (marked's greedy tail
+      // swallows the backslash); a 2-space break ends it (doc-09/10/29).
+      // The URL cannot continue past the newline either way.
+      if (!tk.bs) break;
       segs.push([1, tk]);
       ext += '\\';
       k++;
@@ -1728,6 +1730,14 @@ function isPunctCh(c) {
 // parse(); nested link-text tokenization must not leak tag toggles out.
 let DOC_IN_LINK = false;
 
+// marked's emStrong masking (#n): link-like [...](...) spans (blockSkip
+// link pattern, equal-run code spans in the label) hide their emphasis /
+// del delimiters from the emStrong search — even when the link itself
+// fails to form (doc-16/20/23). Code-span inner backticks are normalized
+// to '+' first (anyPunctuationOutsideCode).
+const LINK_SPAN_STICKY = /\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\\()]|\((?:\\[\s\S]|[^\\()])*\))*\)/y;
+const CODE_SPAN_NORM_RE = /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g;
+
 function inlineTokens(src, refs, inLink) {
   // marked's inLink is per-block inline-lexing state: an unclosed <a> in
   // one paragraph does NOT suppress autolinks in later paragraphs
@@ -1738,13 +1748,14 @@ function inlineTokens(src, refs, inLink) {
   const gated = new Set();
   const n = src.length;
   let i = 0, start = 0;
+  let normSrc = null, maskEnd = -1; // lazy emStrong-mask state (see below)
   const flush = (to) => { if (to > start) { if (DOC_IN_LINK) gated.add(toks.length); toks.push(src.slice(start, to)); } };
   while (i < n) {
     const cc = src.charCodeAt(i);
     if (cc === 92) { // backslash
       const nx = src[i + 1];
       if (nx === '\n') {
-        flush(i); toks.push({ t: 3 }); i += 2;
+        flush(i); toks.push({ t: 3, bs: 1 }); i += 2;
         while (src.charCodeAt(i) === 32 || src.charCodeAt(i) === 9) i++;
         start = i; continue;
       }
@@ -1780,6 +1791,7 @@ function inlineTokens(src, refs, inLink) {
       const ch = src[i];
       let m = 1;
       while (src.charCodeAt(i + m) === cc) m++;
+      if (i < maskEnd) { i += m; continue; } // masked link span: literal
       const before = i > 0 ? src[i - 1] : '';
       const after = i + m < n ? src[i + m] : '';
       const leftFl = !isSpaceCh(after) && (!isPunctCh(after) || isSpaceCh(before) || isPunctCh(before));
@@ -1816,6 +1828,18 @@ function inlineTokens(src, refs, inLink) {
         toks.push({ t: 6, href: L.href, title: L.title, kids: L.kids });
         i = L.end; start = i; continue;
       }
+      // tryLink failed: if this starts a blockSkip-style link span, mask
+      // emphasis/del delimiters inside it (marked's #n masking).
+      if (src.includes('](')) {
+        if (normSrc === null) {
+          normSrc = src.includes('`')
+            ? src.replace(CODE_SPAN_NORM_RE, (m, r, inner) => r + inner.replace(/`/g, '+') + r)
+            : src;
+        }
+        LINK_SPAN_STICKY.lastIndex = i;
+        const lm = LINK_SPAN_STICKY.exec(normSrc);
+        if (lm) maskEnd = Math.max(maskEnd, i + lm[0].length);
+      }
       i++; continue;
     }
     if (cc === 33 && src.charCodeAt(i + 1) === 91) { // '![' — image
@@ -1850,6 +1874,7 @@ function inlineTokens(src, refs, inLink) {
       i++; continue;
     }
     if (cc === 126) { // '~' — strikethrough
+      if (i < maskEnd) { i++; continue; } // masked link span: literal
       const D = tryDel(src, i, refs, inLink);
       if (D) {
         flush(i);
