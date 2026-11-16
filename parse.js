@@ -129,6 +129,19 @@ function splitCells(row, count) {
   return cells;
 }
 
+function countCells(row) {
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < row.length; i++) {
+    if (row[i] === '|' && !isEscapedPipe(row, i)) { cells.push(cur); cur = ''; }
+    else cur += row[i];
+  }
+  cells.push(cur);
+  if (cells.length && cells[0].trim() === '') cells.shift();
+  if (cells.length && cells[cells.length - 1].trim() === '') cells.pop();
+  return cells.length;
+}
+
 // ---------- line utilities ----------
 // [indent columns (tab = next multiple of 4), index of first non-ws char]
 function indentInfo(line) {
@@ -150,19 +163,35 @@ function isBlank(line) {
   return true;
 }
 
-// Strip n columns of indent from the line start (a straddling tab -> spaces).
-function stripIndent(line, n) {
-  let col = 0, i = 0;
-  while (i < line.length && col < n) {
+// Strip n columns starting at index si (which sits at column sc), expanding
+// the remainder of the leading whitespace run to spaces when a tab straddles
+// the boundary — a tab's width is fixed by its original column.
+function stripFrom(line, si, sc, n) {
+  let col = sc, i = si;
+  while (i < line.length && col < sc + n) {
     const c = line.charCodeAt(i);
     if (c === 32) { col++; i++; }
     else if (c === 9) {
       const w = 4 - (col % 4);
-      if (col + w > n) return ' '.repeat(col + w - n) + line.slice(i + 1);
+      if (col + w > sc + n) {
+        let rest = col + w - (sc + n), j = i + 1, cc = col + w;
+        while (j < line.length) {
+          const d = line.charCodeAt(j);
+          if (d === 32) { rest++; cc++; j++; }
+          else if (d === 9) { const ww = 4 - (cc % 4); rest += ww; cc += ww; j++; }
+          else break;
+        }
+        return ' '.repeat(rest) + line.slice(j);
+      }
       col += w; i++;
     } else break;
   }
   return line.slice(i);
+}
+
+// Strip n columns of indent from the line start (a straddling tab -> spaces).
+function stripIndent(line, n) {
+  return stripFrom(line, 0, 0, n);
 }
 
 // ---------- list markers ----------
@@ -199,7 +228,7 @@ function finishMarker(line, ci, col, ord, ch, num, mw) {
     else break;
   }
   if (j >= line.length) return [ord, ch, num, col + mw + 1, line.length];
-  if (wcol >= 5) return [ord, ch, num, col + mw + 1, after + 1];
+  if (wcol >= 5) return [ord, ch, num, col + mw + 1, after + 1, stripFrom(line, after, col + mw, 1)];
   return [ord, ch, num, col + mw + wcol, j];
 }
 
@@ -215,69 +244,39 @@ function hasUnescapedBracket(s) {
   return false;
 }
 
-// Try to parse a definition starting at `line` (title may be on `nextLine`).
-// Returns [linesConsumed, label, dest, title] or null.
-function parseDef(line, nextLine) {
-  let i = 0, sp = 0;
-  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
-    sp += line[i] === ' ' ? 1 : 4 - (sp % 4); i++;
-    if (sp > 3) return null;
-  }
-  if (line[i] !== '[') return null;
-  const close = line.indexOf(']', i + 1);
-  if (close < 0 || close === i + 1) return null;
-  const labelRaw = line.slice(i + 1, close);
-  if (labelRaw.length > 999) return null;
-  if (hasUnescapedBracket(labelRaw)) return null;
-  if (line[close + 1] !== ':') return null;
-  let j = close + 2;
-  while (j < line.length && (line[j] === ' ' || line[j] === '\t')) j++;
-  if (j >= line.length) return null;
-  let dest;
-  if (line[j] === '<') {
-    const gt = line.indexOf('>', j + 1);
-    if (gt < 0) return null;
-    dest = line.slice(j + 1, gt);
-    if (dest.indexOf('<') >= 0) return null;
-    if (/[\x00-\x1f\x7f]/.test(dest)) return null;
-    j = gt + 1;
-  } else {
-    let depth = 0, k = j;
-    while (k < line.length) {
-      const c = line[k];
-      if (c === ' ' || c === '\t') break;
-      if (c === '\\' && k + 1 < line.length) { k += 2; continue; }
-      if (c === '(') depth++;
-      else if (c === ')') { if (depth === 0) break; depth--; }
-      k++;
-    }
-    if (k === j || depth !== 0) return null;
-    dest = line.slice(j, k);
-    j = k;
-  }
-  const label = normLabel(labelRaw);
-  let k = j;
-  while (k < line.length && (line[k] === ' ' || line[k] === '\t')) k++;
-  if (k < line.length && k === j) return null; // title needs whitespace after dest
-  if (k >= line.length) {
-    if (nextLine != null) {
-      const t = parseTitleLine(nextLine);
-      if (t !== null) return [2, label, dest, t];
-    }
-    return [1, label, dest, ''];
-  }
-  const q = line[k];
-  if (q !== '"' && q !== "'" && q !== '(') return null;
-  const closeQ = q === '(' ? ')' : q;
-  let m = k + 1, t = '';
-  while (m < line.length) {
-    const c = line[m];
-    if (c === '\\' && m + 1 < line.length) { t += line[m + 1]; m += 2; continue; }
+// True if s[idx] is preceded by an odd run of backslashes.
+function isEscapedAt(s, idx) {
+  let n = 0;
+  while (idx - 1 - n >= 0 && s[idx - 1 - n] === '\\') n++;
+  return n % 2 === 1;
+}
+
+// Skip spaces/tabs/newlines in a joined def string.
+function skipDefWs(s, p) {
+  while (p < s.length && (s[p] === ' ' || s[p] === '\t' || s[p] === '\n')) p++;
+  return p;
+}
+
+function countNl(s, a, b) {
+  let n = 0;
+  for (let k = a; k < b; k++) if (s[k] === '\n') n++;
+  return n;
+}
+
+// Scan a title starting at s[p] (a quote char). Returns [title, endIndex]
+// where endIndex is just past the closing quote (only ws to EOL after it),
+// or null. Backslash unescapes ASCII punctuation only.
+function scanDefTitle(s, p) {
+  const q = s[p], closeQ = q === '(' ? ')' : q;
+  let m = p + 1, t = '';
+  while (m < s.length) {
+    const c = s[m];
+    if (c === '\\' && m + 1 < s.length && s[m + 1] !== '\n' && ASCII_PUNCT.has(s[m + 1])) { t += s[m + 1]; m += 2; continue; }
     if (c === closeQ) {
       let r = m + 1;
-      while (r < line.length && (line[r] === ' ' || line[r] === '\t')) r++;
-      if (r < line.length) return null;
-      return [1, label, dest, t];
+      while (r < s.length && (s[r] === ' ' || s[r] === '\t')) r++;
+      if (r < s.length && s[r] !== '\n') return null;
+      return [t, m + 1];
     }
     if (q === '(' && c === '(') return null;
     t += c; m++;
@@ -285,28 +284,85 @@ function parseDef(line, nextLine) {
   return null;
 }
 
-// A line holding only a title (plus whitespace) -> title text, else null.
-function parseTitleLine(line) {
-  let k = 0;
-  while (k < line.length && (line[k] === ' ' || line[k] === '\t')) k++;
-  if (k >= line.length) return null;
-  const q = line[k];
-  if (q !== '"' && q !== "'" && q !== '(') return null;
-  const closeQ = q === '(' ? ')' : q;
-  let m = k + 1, t = '';
-  while (m < line.length) {
-    const c = line[m];
-    if (c === '\\' && m + 1 < line.length) { t += line[m + 1]; m += 2; continue; }
-    if (c === closeQ) {
-      let r = m + 1;
-      while (r < line.length && (line[r] === ' ' || line[r] === '\t')) r++;
-      if (r < line.length) return null;
-      return t;
-    }
-    if (q === '(' && c === '(') return null;
-    t += c; m++;
+// Array-form definition parse: the label, dest and title may each span
+// lines (but never a blank line). Returns [linesConsumed, label, dest,
+// title] or null.
+function parseDefArr(L, i, e) {
+  const first = L[i];
+  let ci = 0, sp = 0;
+  while (ci < first.length && (first[ci] === ' ' || first[ci] === '\t')) {
+    sp += first[ci] === ' ' ? 1 : 4 - (sp % 4); ci++;
+    if (sp > 3) return null;
   }
-  return null;
+  if (first[ci] !== '[') return null;
+  let end = i;
+  while (end < e && end < i + 10 && !isBlank(L[end])) end++;
+  const s = L.slice(i, end).join('\n');
+  let p = ci + 1, labelEnd = -1;
+  while (p < s.length) {
+    const c = s[p];
+    if (c === '[' && !isEscapedAt(s, p)) return null;
+    if (c === ']' && !isEscapedAt(s, p)) { labelEnd = p; break; }
+    p++;
+  }
+  if (labelEnd < 0) return null;
+  const labelRaw = s.slice(ci + 1, labelEnd);
+  if (labelRaw.length === 0 || labelRaw.length > 999 || labelRaw.trim() === '') return null;
+  if (s[labelEnd + 1] !== ':') return null;
+  p = skipDefWs(s, labelEnd + 2);
+  if (p >= s.length) return null;
+  let dest;
+  if (s[p] === '<') {
+    const gt = s.indexOf('>', p + 1);
+    const nl = s.indexOf('\n', p + 1);
+    if (gt < 0 || (nl >= 0 && nl < gt)) return null;
+    dest = s.slice(p + 1, gt);
+    if (dest.indexOf('<') >= 0 || /[\x00-\x1f\x7f]/.test(dest)) return null;
+    p = gt + 1;
+  } else {
+    let depth = 0, k = p;
+    while (k < s.length) {
+      const c = s[k];
+      if (c === ' ' || c === '\t' || c === '\n') break;
+      if (c === '\\' && k + 1 < s.length && s[k + 1] !== '\n') { k += 2; continue; }
+      if (c === '(') depth++;
+      else if (c === ')') { if (depth === 0) break; depth--; }
+      k++;
+    }
+    if (k === p || depth !== 0) return null;
+    dest = s.slice(p, k);
+    p = k;
+  }
+  const label = normLabel(labelRaw);
+  const destLines = 1 + countNl(s, 0, p);
+  let r = p;
+  while (r < s.length && (s[r] === ' ' || s[r] === '\t')) r++;
+  if (r < s.length && s[r] !== '\n' && r === p) return null; // junk/title needs ws after dest
+  if (r >= s.length || s[r] === '\n') {
+    if (r < s.length && s[r] === '\n') {
+      let t0 = r + 1;
+      while (t0 < s.length && (s[t0] === ' ' || s[t0] === '\t')) t0++;
+      if (t0 < s.length) {
+        const qc = s[t0];
+        if (qc === '"' || qc === "'" || qc === '(') {
+          // a next-line title that fails to parse leaves a valid def
+          const t = scanDefTitle(s, t0);
+          if (t !== null) return [1 + countNl(s, 0, t[1]), label, dest, t[0]];
+        }
+      }
+    }
+    return [destLines, label, dest, ''];
+  }
+  const qc = s[r];
+  if (qc !== '"' && qc !== "'" && qc !== '(') return null;
+  const t = scanDefTitle(s, r);
+  if (t === null) return null;
+  return [1 + countNl(s, 0, t[1]), label, dest, t[0]];
+}
+
+// Single-line wrapper for callers without the array (lazy checks, prev-line).
+function parseDef(line, nextLine) {
+  return nextLine == null ? parseDefArr([line], 0, 1) : parseDefArr([line, nextLine], 0, 2);
 }
 
 // ---------- refs pre-pass ----------
@@ -329,7 +385,7 @@ function stripPrefixes(line) {
       continue;
     }
     const m = matchListMarker(s, ci, col);
-    if (m) { s = s.slice(m[4]); continue; }
+    if (m) { s = m.length > 5 ? m[5] : s.slice(m[4]); continue; }
     return s;
   }
   return s;
@@ -356,11 +412,10 @@ function prevAllowsDef(prev) {
 function collectRefs(lines) {
   const refs = new Map();
   const stripped = new Array(lines.length);
-  let fenceCh = 0, fenceLen = 0;
+  for (let k = 0; k < lines.length; k++) stripped[k] = stripPrefixes(lines[k]);
+  let fenceCh = 0, fenceLen = 0, skipUntil = -1;
   for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const s = stripPrefixes(raw);
-    stripped[i] = s;
+    const s = stripped[i];
     if (fenceCh) {
       const [col, ci] = indentInfo(s);
       if (col <= 3 && s.charCodeAt(ci) === fenceCh) {
@@ -381,9 +436,13 @@ function collectRefs(lines) {
         if (n >= 3 && (c === 126 || s.indexOf('`', j) < 0)) { fenceCh = c; fenceLen = n; continue; }
       }
     }
-    if (!prevAllowsDef(i === 0 ? null : stripped[i - 1])) continue;
-    const d = parseDef(s, i + 1 < lines.length ? stripped[i + 1] : null);
-    if (d && !refs.has(d[1])) refs.set(d[1], { href: d[2], title: d[3] });
+    if (i < skipUntil) continue;
+    if (i !== skipUntil && !prevAllowsDef(i === 0 ? null : stripped[i - 1])) continue;
+    const d = parseDefArr(stripped, i, stripped.length);
+    if (d) {
+      if (!refs.has(d[1])) refs.set(d[1], { href: d[2], title: d[3] });
+      skipUntil = i + d[0];
+    }
   }
   return refs;
 }
@@ -416,13 +475,17 @@ function matchATX(line, ci) {
   return [n, content];
 }
 
-// Setext underline: returns 1 (=), 2 (-), or 0.
+// Setext underline: returns 1 (=), 2 (-), or 0. The run must be contiguous
+// (only trailing whitespace may follow); `= =` and `--- -` are not underlines.
 function setextKind(line, ci) {
   const c = line.charCodeAt(ci);
   if (c !== 61 && c !== 45) return 0;
+  let seenWs = false;
   for (let i = ci + 1; i < line.length; i++) {
     const d = line.charCodeAt(i);
-    if (d !== c && d !== 32 && d !== 9) return 0;
+    if (d === c) { if (seenWs) return 0; }
+    else if (d === 32 || d === 9) seenWs = true;
+    else return 0;
   }
   return c === 61 ? 1 : 2;
 }
@@ -463,7 +526,7 @@ function htmlBlockKind(line, ci) {
   const m = /^<\/?([a-zA-Z][a-zA-Z0-9-]*)(\s|\/?>|$)/.exec(line.slice(ci));
   if (!m) return [0, null];
   const tag = m[1].toLowerCase();
-  if (tag === 'script' || tag === 'pre' || tag === 'style' || tag === 'textarea') {
+  if (line.charCodeAt(ci + 1) !== 47 && (tag === 'script' || tag === 'pre' || tag === 'style' || tag === 'textarea')) {
     return [1, '</' + tag];
   }
   // Type 7: a complete open/close tag alone on the line (strict tag pattern
@@ -480,7 +543,10 @@ function htmlBlockKind(line, ci) {
 }
 
 // Consume an HTML block starting at lines[i]; returns [htmlText, nextIndex].
-function parseHtmlBlock(lines, i, e) {
+// `top` is true only for the document's top-level call: the trailing-newline
+// rule for a block ending at the final '' applies only there (inside a quote
+// or list item the '' is synthetic and marked emits no trailing newline).
+function parseHtmlBlock(lines, i, e, top) {
   const [col, ci] = indentInfo(lines[i]);
   const [kind, closer] = htmlBlockKind(lines[i], ci);
   let j = i;
@@ -489,28 +555,33 @@ function parseHtmlBlock(lines, i, e) {
     for (; j < e; j++) {
       if (lines[j].toLowerCase().indexOf(needle) >= 0) { j++; break; }
     }
-    // trailing newline kept iff the next line is non-blank
+    // trailing newline kept iff a non-blank line follows, or (top level
+    // only) the block ends at the final '' (the document's trailing newline)
     const text = lines.slice(i, j).join('\n');
-    return [j < e && !isBlank(lines[j]) ? text + '\n' : text, j];
+    return [j < e && (!isBlank(lines[j]) || (top && j === e - 1 && lines[j] === '')) ? text + '\n' : text, j];
   }
   for (; j < e; j++) {
     if (isBlank(lines[j])) break;
   }
-  return [lines.slice(i, j).join('\n'), j];
+  const text = lines.slice(i, j).join('\n');
+  return [top && j === e - 1 && lines[j] === '' ? text + '\n' : text, j];
 }
 
 // ---------- block parser ----------
 // lazy: null, or a boolean array (same indexing as lines) marking lazy
 // continuation lines, which never count as setext underlines or table rows.
-function parseBlocks(L, s, e, out, refs, tight, lazy) {
-  let i = s;
+function parseBlocks(L, s, e, out, refs, tight, lazy, looseOut, top) {
+  let i = s, prevBlock = false, prevDef = false, sawBlank = false;
   while (i < e) {
     const line = L[i];
-    if (isBlank(line)) { i++; continue; }
+    if (isBlank(line)) { if (prevBlock || prevDef) sawBlank = true; i++; continue; }
+    const d = parseDefArr(L, i, e);
+    if (d) { if (sawBlank && looseOut) looseOut.loose = true; sawBlank = false; prevDef = true; i += d[0]; continue; }
+    if (sawBlank && looseOut) looseOut.loose = true;
+    sawBlank = false;
+    prevBlock = true;
     const [ind, ci] = indentInfo(line);
     if (ind >= 4) { i = parseIndentedCode(L, i, e, out); continue; }
-    const d = parseDef(line, i + 1 < e ? L[i + 1] : null);
-    if (d) { i += d[0]; continue; }
     const ch = line.charCodeAt(ci);
     if (ch === 35) {
       const h = matchATX(line, ci);
@@ -528,15 +599,16 @@ function parseBlocks(L, s, e, out, refs, tight, lazy) {
       }
     } else if (ch === 60) {
       if (htmlBlockKind(line, ci)[0] > 0) {
-        const hb = parseHtmlBlock(L, i, e);
+        const hb = parseHtmlBlock(L, i, e, top);
         out.push(hb[0]); i = hb[1]; continue;
       }
     } else if (ch >= 48 && ch <= 57) {
       const m = matchListMarker(line, ci, ind);
       if (m) { i = parseList(L, i, e, out, refs, m); continue; }
     }
-    if (line.indexOf('|', ci) >= 0 && i + 1 < e && matchDelimRow(L[i + 1])) {
-      i = parseTable(L, i, e, out, refs); continue;
+    if (line.indexOf('|', ci) >= 0 && i + 1 < e) {
+      const al = matchDelimRow(L[i + 1]);
+      if (al && countCells(line) === al.length) { i = parseTable(L, i, e, out, refs); continue; }
     }
     i = parseParagraph(L, i, e, out, refs, tight, lazy);
   }
@@ -581,7 +653,7 @@ function parseParagraph(L, i, e, out, refs, tight, lazy) {
     // delimiter row (even a pipe-less header); the table itself then fails
     // and the lines become a new paragraph. A plain ---/=== row is setext.
     if (ind <= 3 && j + 1 < e && matchDelimRow(L[j + 1]) && (L[j + 1].indexOf('|') >= 0 || L[j + 1].indexOf(':') >= 0) && !(lazy && (lazy[j] || lazy[j + 1]))) break;
-    if (interruptsPara(L, j, e)) break;
+    if (interruptsPara(L, j, e) && !(lazy && lazy[j])) break;
     j++;
   }
   const text = L.slice(i, j).join('\n');
@@ -590,7 +662,7 @@ function parseParagraph(L, i, e, out, refs, tight, lazy) {
     const [ind2, ci2] = indentInfo(L[j]);
     const sk = ind2 <= 3 ? setextKind(L[j], ci2) : 0;
     if (sk > 0 && !(lazy && lazy[j])) {
-      out.push('<h' + sk + '>' + inline(text, refs) + '</h' + sk + '>\n');
+      out.push('<h' + sk + '>' + inline(text.trim(), refs) + '</h' + sk + '>\n');
       return j + 1;
     }
   }
@@ -626,8 +698,8 @@ function parseFenced(L, i, e, out, f, ind) {
   const content = [];
   for (let k = i + 1; k < j; k++) content.push(ind > 0 ? stripIndent(L[k], ind) : L[k]);
   let text = content.join('\n');
-  if (closed) text += '\n';
-  const lang = info === '' ? '' : ' class="language-' + escRaw(info.split(/\s+/)[0]) + '"';
+  if (closed && content.length && content[content.length - 1] !== '') text += '\n';
+  const lang = info === '' ? '' : ' class="language-' + escText(unescBS(info.split(/\s+/)[0])) + '"';
   out.push('<pre><code' + lang + '>' + escRaw(text) + '</code></pre>\n');
   return closed ? j + 1 : j;
 }
@@ -647,7 +719,7 @@ function parseIndentedCode(L, i, e, out) {
         break;
       }
       if (!found) break;
-      content.push('');
+      content.push(stripIndent(line, 4));
       j++;
       continue;
     }
@@ -663,13 +735,93 @@ function parseIndentedCode(L, i, e, out) {
 
 // ---------- blockquote ----------
 function stripQuotePrefix(line, ci, col) {
-  let j = ci + 1;
+  const j = ci + 1;
   if (line.charCodeAt(j) === 32) return line.slice(j + 1);
-  if (line.charCodeAt(j) === 9) {
-    const w = 4 - ((col + 1) % 4);
-    return ' '.repeat(w - 1) + line.slice(j + 1);
-  }
+  if (line.charCodeAt(j) === 9) return stripFrom(line, j, col + 1, 1);
   return line.slice(j);
+}
+
+// Strip repeated leading quote prefixes ('> > foo' -> 'foo').
+function stripQuoteLevels(line) {
+  let s = line;
+  for (let k = 0; k < 8; k++) {
+    const [col, ci] = indentInfo(s);
+    if (col > 3 || s.charCodeAt(ci) !== 62) return s;
+    s = stripQuotePrefix(s, ci, col);
+  }
+  return s;
+}
+
+// True if the last block of `inner` (quote/list content lines) is an open
+// paragraph — the only block a lazy continuation line may join. Scans the
+// lines tracking fence / html-block / table state.
+function lastInnerIsPara(inner) {
+  let fenceCh = 0, fenceLen = 0, htmlKind = 0, htmlCloser = null, inTable = false;
+  let last = 0; // 0 none, 1 paragraph, 2 other block
+  for (let k = 0; k < inner.length; k++) {
+    // classify the line at its deepest quote level: a nested quote's
+    // paragraph is open for lazy continuation too (cm-250/251/292/293)
+    const line = stripQuoteLevels(inner[k]);
+    if (fenceCh) {
+      const [col, ci] = indentInfo(line);
+      if (col <= 3 && line.charCodeAt(ci) === fenceCh) {
+        let n = 0, j = ci;
+        while (line.charCodeAt(j) === fenceCh) { n++; j++; }
+        let ok = n >= fenceLen;
+        while (ok && j < line.length) { const d = line.charCodeAt(j); if (d !== 32 && d !== 9) ok = false; j++; }
+        if (ok) { fenceCh = 0; last = 2; continue; }
+      }
+      last = 2; continue;
+    }
+    if (htmlKind > 0) {
+      if (htmlKind <= 5) {
+        if (line.toLowerCase().indexOf(htmlCloser) >= 0) htmlKind = 0;
+        last = 2; continue;
+      }
+      if (isBlank(line)) { htmlKind = 0; last = 0; continue; }
+      last = 2; continue;
+    }
+    if (isBlank(line)) { last = 0; inTable = false; continue; }
+    const [ind, ci] = indentInfo(line);
+    if (ind >= 4) { last = 2; inTable = false; continue; }
+    const ch = line.charCodeAt(ci);
+    if (inTable) {
+      if ((ch === 35 && matchATX(line, ci)) || ch === 62 || ((ch === 96 || ch === 126) && matchFence(line, ci)) || isHR(line, ci) || matchListMarker(line, ci, ind) || (ch === 60 && htmlBlockKind(line, ci)[0] > 0)) inTable = false;
+      else { last = 2; continue; }
+    }
+    if (ch === 35 && matchATX(line, ci)) { last = 2; continue; }
+    if (ch === 62) { last = 2; continue; }
+    if (ch === 96 || ch === 126) {
+      const f = matchFence(line, ci);
+      if (f) { fenceCh = f[0]; fenceLen = f[1]; last = 2; continue; }
+    }
+    if (ch === 45 || ch === 43 || ch === 42 || ch === 95) {
+      if (isHR(line, ci)) { last = 2; continue; }
+    }
+    if (ch === 60) {
+      const hk = htmlBlockKind(line, ci);
+      if (hk[0] > 0) { htmlKind = hk[0]; htmlCloser = hk[1] ? hk[1].toLowerCase() : null; last = 2; continue; }
+    }
+    const dm = matchDelimRow(line);
+    if (dm && last === 1) { last = 2; inTable = true; continue; }
+    if (last === 1 && ind <= 3 && setextKind(line, ci) > 0) { last = 2; continue; }
+    const lm = matchListMarker(line, ci, ind);
+    if (lm) {
+      // A list item whose first block is a paragraph leaves it open for lazy
+      // continuation (CommonMark allows lazy lines into a nested item's para).
+      const rest = lm.length > 5 ? lm[5] : line.slice(lm[4]);
+      if (isBlank(rest)) { last = 2; continue; }
+      const [ri, rc] = indentInfo(rest);
+      if (ri >= 4) { last = 2; continue; }
+      const rch = rest.charCodeAt(rc);
+      if ((rch === 35 && matchATX(rest, rc)) || ((rch === 96 || rch === 126) && matchFence(rest, rc)) || isHR(rest, rc) || (rch === 60 && htmlBlockKind(rest, rc)[0] > 0) || parseDef(rest, null) !== null) { last = 2; continue; }
+      last = 1; continue;
+    }
+    const dd = parseDef(line, k + 1 < inner.length ? stripQuoteLevels(inner[k + 1]) : null);
+    if (dd) { k += dd[0] - 1; last = 2; continue; }
+    last = 1;
+  }
+  return last === 1;
 }
 
 function parseQuote(L, i, e, out, refs) {
@@ -685,15 +837,21 @@ function parseQuote(L, i, e, out, refs) {
       j++;
       continue;
     }
-    // lazy continuation: non-blank, no block start, paragraph still open
-    if (inner.length && !isBlank(inner[inner.length - 1]) && !interruptsPara(L, j, e) && parseDef(line, null) === null) {
-      inner.push(line);
+    // lazy continuation: only when the last inner block is a paragraph
+    if (lastInnerIsPara(inner) && !interruptsPara(L, j, e) && parseDef(line, null) === null) {
+      const stripped = line.replace(/^[ \t]+/, '');
+      const [ind2, ci2] = indentInfo(stripped);
+      if (ind2 <= 3 && setextKind(stripped, ci2) > 0) inner.push('    ' + stripped);
+      else inner.push(stripped);
       lazy.push(true);
       j++;
       continue;
     }
     break;
   }
+  // the region ended at a blank line: keep it, so an unclosed fence / html
+  // block at the end still sees the document's trailing newline
+  if (j < e && isBlank(L[j])) { inner.push(''); lazy.push(false); }
   const sub = [];
   parseBlocks(inner, 0, inner.length, sub, refs, false, lazy);
   out.push('<blockquote>\n' + sub.join('') + '</blockquote>\n');
@@ -711,17 +869,18 @@ function parseList(L, i, e, out, refs, first) {
     const line = L[j];
     if (isBlank(line)) break;
     const [ind, ci] = indentInfo(line);
+    if (ind <= 3 && isHR(line, ci)) break; // an HR line ends the list
     const m = ind <= 3 ? matchListMarker(line, ci, ind) : null;
     if (!m || m[0] !== ord || m[1] !== ch || ind >= lastCCol) break;
     // collect one item
     const content = [], lazy = [];
     const cCol = m[3];
     lastCCol = cCol;
-    const firstLine = line.slice(m[4]);
+    const firstLine = m.length > 5 ? m[5] : line.slice(m[4]);
     content.push(firstLine);
     lazy.push(false);
     j++;
-    let sawBlank = false;
+    let endBlank = false;
     while (j < e) {
       const ln = L[j];
       if (isBlank(ln)) {
@@ -732,14 +891,14 @@ function parseList(L, i, e, out, refs, first) {
           const [ind2, ci2] = indentInfo(L[k]);
           const m2 = ind2 <= 3 ? matchListMarker(L[k], ci2, ind2) : null;
           if (m2 && m2[0] === ord && m2[1] === ch && ind2 < cCol) nextIsItem = true;
-          else if (indentInfo(L[k])[0] >= cCol) nextIsContent = true;
+          else if (content.some((l) => !isBlank(l)) && indentInfo(L[k])[0] >= cCol) nextIsContent = true;
         }
-        if (nextIsItem) { loose = true; j = k; break; }
+        if (nextIsItem) { loose = true; endBlank = true; j = k; break; }
         if (nextIsContent) {
-          sawBlank = true;
           while (j < k) { content.push(''); lazy.push(false); j++; }
           continue;
         }
+        endBlank = true;
         break;
       }
       const [ind2, ci2] = indentInfo(ln);
@@ -747,16 +906,14 @@ function parseList(L, i, e, out, refs, first) {
       if (m2 && m2[0] === ord && m2[1] === ch && ind2 < cCol) break;
       if (m2 && ind2 < cCol) break; // different marker: list ends here
       if (ind2 >= cCol) {
-        if (sawBlank) loose = true;
-        sawBlank = false;
         content.push(stripIndent(ln, cCol));
         lazy.push(false);
         j++;
         continue;
       }
       // lazy continuation of the item's paragraph
-      if (content.length && !isBlank(content[content.length - 1]) && !interruptsPara(L, j, e) && parseDef(ln, null) === null) {
-        content.push(ln);
+      if (lastInnerIsPara(content) && !interruptsPara(L, j, e) && parseDef(ln, null) === null) {
+        content.push(ln.replace(/^[ \t]+/, ''));
         lazy.push(true);
         j++;
         continue;
@@ -764,10 +921,16 @@ function parseList(L, i, e, out, refs, first) {
       break;
     }
     while (content.length && isBlank(content[content.length - 1])) { content.pop(); lazy.pop(); }
+    if (endBlank) { content.push(''); lazy.push(false); }
     items.push([content, lazy]);
   }
   const tag = ord ? (startNum !== 1 ? '<ol start="' + startNum + '">\n' : '<ol>\n') : '<ul>\n';
   out.push(tag);
+  // Two-pass looseness: parse each item tight first, collecting whether any
+  // item holds two blocks separated by a blank line at its own level; only
+  // then (if loose) re-parse with <p> wrappers. A blank inside a nested
+  // sublist does not loosen the outer list.
+  const rendered = [];
   for (const [content, lazy] of items) {
     let task = null;
     if (content.length && !isBlank(content[0])) {
@@ -777,8 +940,20 @@ function parseList(L, i, e, out, refs, first) {
         content[0] = content[0].slice(t[0].length);
       }
     }
+    const lo = { loose: false };
     const sub = [];
-    parseBlocks(content, 0, content.length, sub, refs, !loose, lazy);
+    parseBlocks(content, 0, content.length, sub, refs, true, lazy, lo);
+    if (lo.loose) loose = true;
+    rendered.push([sub, task]);
+  }
+  if (loose) {
+    for (let q = 0; q < items.length; q++) {
+      const sub = [];
+      parseBlocks(items[q][0], 0, items[q][0].length, sub, refs, false, items[q][1], null);
+      rendered[q][0] = sub;
+    }
+  }
+  for (const [sub, task] of rendered) {
     let body = sub.join('');
     if (task !== null) {
       body = '<input' + (task ? ' checked=""' : '') + ' disabled="" type="checkbox"> ' + body;
@@ -1564,6 +1739,6 @@ export function parse(markdown) {
   const lines = src.split('\n');
   const refs = collectRefs(lines);
   const out = [];
-  parseBlocks(lines, 0, lines.length, out, refs, false, null);
+  parseBlocks(lines, 0, lines.length, out, refs, false, null, null, true);
   return out.join('');
 }
