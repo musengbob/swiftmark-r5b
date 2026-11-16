@@ -737,6 +737,12 @@ function parseParagraph(L, i, e, out, refs, tight, lazy, inItem) {
     if (interruptsPara(L, j, e, inItem) && !(lazy && lazy[j])) break;
     j++;
   }
+  // Join with single \n. (A code-merged line followed by a plain line is
+  // "\n\n" in marked — its code token swallows the newline — but only when
+  // our strip amounts match marked's exactly; where the item indent
+  // differs the extra \n misfires and regresses docs (doc-04/15/30 in
+  // 2j). The strip itself is the win; the \n\n refinement needs the
+  // indent alignment fixed first. See the phase report.)
   const text = L.slice(i, j).join('\n');
   // Setext heading?
   if (j < e && !isBlank(L[j])) {
@@ -845,14 +851,17 @@ function stripQuoteLevels(line) {
 
 // True if the last block of `inner` (quote/list content lines) is an open
 // paragraph — the only block a lazy continuation line may join. Scans the
-// lines tracking fence / html-block / table state.
-function lastInnerIsPara(inner) {
+// lines tracking fence / html-block / table state. `lazy` (same indexing)
+// marks lines that already joined a paragraph: they count as paragraph
+// text even when they look like a block start (a code-merged '# head').
+function lastInnerIsPara(inner, lazy) {
   let fenceCh = 0, fenceLen = 0, htmlKind = 0, htmlCloser = null, inTable = false;
   let last = 0; // 0 none, 1 paragraph, 2 other block
   for (let k = 0; k < inner.length; k++) {
     // classify the line at its deepest quote level: a nested quote's
     // paragraph is open for lazy continuation too (cm-250/251/292/293)
     const line = stripQuoteLevels(inner[k]);
+    if (lazy && lazy[k]) { last = 1; continue; }
     if (fenceCh) {
       const [col, ci] = indentInfo(line);
       if (col <= 3 && line.charCodeAt(ci) === fenceCh) {
@@ -915,6 +924,46 @@ function lastInnerIsPara(inner) {
   return last === 1;
 }
 
+// True if the open paragraph (lastInnerIsPara must already be true) is a
+// DIRECT paragraph of this container — not inside a nested list item or
+// quote. Walks back over the paragraph's run: it is nested iff the run
+// starts at a list-marker or quote line. A code-merge (an indented line
+// joining the paragraph with 4 columns stripped) applies only to a direct
+// paragraph: inside a nested container the inner container applies its own
+// strip when it parses the line (marked lexes the inner text separately).
+function lastInnerDirectPara(lines, lazy) {
+  let k = lines.length - 1;
+  while (k >= 0 && isBlank(lines[k])) k--;
+  if (k < 0) return false;
+  let start = k;
+  while (start > 0) {
+    const prev = lines[start - 1];
+    if (isBlank(prev)) break;
+    if (lazy && lazy[start - 1]) { start--; continue; }
+    const [ind, ci] = indentInfo(prev);
+    if (ind <= 3) {
+      const ch = prev.charCodeAt(ci);
+      if (ch === 62) return false; // quote line: para lives in a quote
+      if (matchListMarker(prev, ci, ind)) return false; // nested list item
+      if (ch === 35 && matchATX(prev, ci)) break;
+      if ((ch === 96 || ch === 126) && matchFence(prev, ci)) break;
+      if (isHR(prev, ci)) break;
+      if (ch === 60 && htmlBlockKind(prev, ci)[0] > 0) break;
+      if (setextKind(prev, ci) > 0) break;
+      if (matchDelimRow(prev)) break;
+      if (parseDef(prev, null) !== null) break;
+    } else break; // indented line: ends the run (indented code)
+    start--;
+  }
+  // the run starts at lines[start]: nested iff it is a quote/marker line
+  const [ind0, ci0] = indentInfo(lines[start]);
+  if (ind0 <= 3) {
+    if (lines[start].charCodeAt(ci0) === 62) return false;
+    if (matchListMarker(lines[start], ci0, ind0)) return false;
+  }
+  return true;
+}
+
 function parseQuote(L, i, e, out, refs) {
   const inner = [], lazy = [];
   let j = i;
@@ -928,13 +977,14 @@ function parseQuote(L, i, e, out, refs) {
       j++;
       continue;
     }
-    // lazy continuation: only when the last inner block is a paragraph
-    if (lastInnerIsPara(inner) && !interruptsPara(L, j, e) && parseDef(line, null) === null) {
-      const stripped = line.replace(/^[ \t]+/, '');
-      const [ind2, ci2] = indentInfo(stripped);
-      if (ind2 <= 3 && setextKind(stripped, ci2) > 0) inner.push('    ' + stripped);
-      else inner.push(stripped);
-      lazy.push(true);
+    // lazy continuation: only when the last inner block is a paragraph.
+    // marked keeps the raw line (leading whitespace included); a line
+    // indented >= 4 is lexed as indented code merged into the paragraph,
+    // with 4 columns stripped (marked's code-merge in blockTokens).
+    if (lastInnerIsPara(inner, lazy) && !interruptsPara(L, j, e) && parseDef(line, null) === null) {
+      const [lind] = indentInfo(line);
+      if (lind >= 4) { inner.push(stripIndentTab(line, 4)); lazy.push(2); }
+      else { inner.push(line); lazy.push(true); }
       j++;
       continue;
     }
@@ -997,15 +1047,33 @@ function parseList(L, i, e, out, refs, first) {
       if (m2 && m2[0] === ord && m2[1] === ch && ind2 < cCol) break;
       if (m2 && ind2 < cCol) break; // different marker: list ends here
       if (ind2 >= cCol) {
-        content.push(stripIndentTab(ln, cCol));
-        lazy.push(false);
+        const stripped = stripIndentTab(ln, cCol);
+        // code-merge: a line still indented >= 4 that joins a DIRECT
+        // paragraph is lexed as indented code merged into it, with 4 more
+        // columns stripped (marked's code-merge). Inside a nested list or
+        // quote the inner container applies its own strip instead.
+        const [rind] = indentInfo(stripped);
+        if (rind >= 4 && lastInnerIsPara(content, lazy) && lastInnerDirectPara(content, lazy)) {
+          content.push(stripIndentTab(stripped, 4));
+          lazy.push(2);
+        } else {
+          content.push(stripped);
+          lazy.push(false);
+        }
         j++;
         continue;
       }
-      // lazy continuation of the item's paragraph
-      if (lastInnerIsPara(content) && !interruptsPara(L, j, e, true) && parseDef(ln, null) === null) {
-        content.push(ln.replace(/^[ \t]+/, ''));
-        lazy.push(true);
+      // lazy continuation of the item's paragraph: marked keeps the raw
+      // line; >= 4 indent is a code-merge (4 columns stripped). Marked
+      // rejects a lazy line when the previous item line (after the
+      // item-indent strip) starts its content at column >= 4 — exactly
+      // what a code-merged line had before its strip.
+      let pc = content.length - 1;
+      while (pc >= 0 && isBlank(content[pc])) pc--;
+      if (pc < 0 || lazy[pc] !== 2) if (lastInnerIsPara(content, lazy) && !interruptsPara(L, j, e, true) && parseDef(ln, null) === null) {
+        const [lind] = indentInfo(ln);
+        if (lind >= 4) { content.push(stripIndentTab(ln, 4)); lazy.push(2); }
+        else { content.push(ln); lazy.push(true); }
         j++;
         continue;
       }
