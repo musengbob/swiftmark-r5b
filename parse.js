@@ -878,13 +878,25 @@ function stripQuoteLevels(line) {
   return s;
 }
 
+// Number of leading `>` levels (same loop as stripQuoteLevels).
+function quoteDepth(line) {
+  let s = line, d = 0;
+  for (let k = 0; k < 8; k++) {
+    const [col, ci] = indentInfo(s);
+    if (col > 3 || s.charCodeAt(ci) !== 62) return d;
+    s = stripQuotePrefix(s, ci, col);
+    d++;
+  }
+  return d;
+}
+
 // True if the last block of `inner` (quote/list content lines) is an open
 // paragraph — the only block a lazy continuation line may join. Scans the
 // lines tracking fence / html-block / table state. `lazy` (same indexing)
 // marks lines that already joined a paragraph: they count as paragraph
 // text even when they look like a block start (a code-merged '# head').
 function lastInnerIsPara(inner, lazy) {
-  let fenceCh = 0, fenceLen = 0, htmlKind = 0, htmlCloser = null, inTable = false;
+  let fenceCh = 0, fenceLen = 0, fenceDepth = 0, htmlKind = 0, htmlCloser = null, inTable = false;
   let last = 0; // 0 none, 1 paragraph, 2 other block
   for (let k = 0; k < inner.length; k++) {
     // classify the line at its deepest quote level: a nested quote's
@@ -892,15 +904,23 @@ function lastInnerIsPara(inner, lazy) {
     const line = stripQuoteLevels(inner[k]);
     if (lazy && lazy[k]) { last = 1; continue; }
     if (fenceCh) {
-      const [col, ci] = indentInfo(line);
-      if (col <= 3 && line.charCodeAt(ci) === fenceCh) {
-        let n = 0, j = ci;
-        while (line.charCodeAt(j) === fenceCh) { n++; j++; }
-        let ok = n >= fenceLen;
-        while (ok && j < line.length) { const d = line.charCodeAt(j); if (d !== 32 && d !== 9) ok = false; j++; }
-        if (ok) { fenceCh = 0; last = 2; continue; }
+      // A fence opened inside a nested quote ends when that quote ends:
+      // a non-blank line at a shallower quote depth has left the fence's
+      // container (doc-21: `> plain` after a ```rust fence in `> >`).
+      // Blank lines are fence content and never close it. Fall through
+      // to classify the line in the outer container.
+      if (!isBlank(line) && quoteDepth(inner[k]) < fenceDepth) { fenceCh = 0; }
+      else {
+        const [col, ci] = indentInfo(line);
+        if (col <= 3 && line.charCodeAt(ci) === fenceCh) {
+          let n = 0, j = ci;
+          while (line.charCodeAt(j) === fenceCh) { n++; j++; }
+          let ok = n >= fenceLen;
+          while (ok && j < line.length) { const d = line.charCodeAt(j); if (d !== 32 && d !== 9) ok = false; j++; }
+          if (ok) { fenceCh = 0; last = 2; continue; }
+        }
+        last = 2; continue;
       }
-      last = 2; continue;
     }
     if (htmlKind > 0) {
       if (htmlKind <= 5) {
@@ -922,7 +942,7 @@ function lastInnerIsPara(inner, lazy) {
     if (ch === 62) { last = 2; continue; }
     if (ch === 96 || ch === 126) {
       const f = matchFence(line, ci);
-      if (f) { fenceCh = f[0]; fenceLen = f[1]; last = 2; continue; }
+      if (f) { fenceCh = f[0]; fenceLen = f[1]; fenceDepth = quoteDepth(inner[k]); last = 2; continue; }
     }
     if (ch === 45 || ch === 43 || ch === 42 || ch === 95) {
       if (isHR(line, ci)) { last = 2; continue; }
@@ -1165,8 +1185,18 @@ function parseList(L, i, e, out, refs, first) {
       // lazy line right after the fence OPENER is blocked.
       let pc = content.length - 1;
       while (pc >= 0 && isBlank(content[pc])) pc--;
-      let blocked = pc < 0 || lazy[pc] === 2;
-      if (!blocked) {
+      let blocked = pc < 0;
+      let afterCodeMerge = false;
+      if (!blocked && lazy[pc] === 2) {
+        // A lazy line indented >= 4 after a code-merged line still joins:
+        // it code-merges into the same paragraph (doc-22, probe2q7 A/B).
+        // A dedented one starts a NEW paragraph in the item in marked
+        // (probe2q8 D/E) — not handled yet, keep blocking those.
+        const [lind0] = indentInfo(ln);
+        if (lind0 >= 4) afterCodeMerge = true;
+        else blocked = true;
+      }
+      if (!blocked && !afterCodeMerge) {
         let mPrev = content[pc];
         if (lazy[pc] === true) {
           // raw lazy line: marked slices R chars off the tab-expanded
@@ -1210,6 +1240,12 @@ function parseList(L, i, e, out, refs, first) {
   // item holds two blocks separated by a blank line at its own level; only
   // then (if loose) re-parse with <p> wrappers. A blank inside a nested
   // sublist does not loosen the outer list.
+  // DOC_IN_LINK is document-order state (marked's lexer.state.inLink): the
+  // tight pre-pass toggles it as it tokenizes items, so a loose re-parse
+  // would start from the END-of-list flag state and mis-gate autolinks in
+  // early items (docs 03/06/35). Save the list-start state and restore it
+  // before the re-parse so the replay sees true document order (probe2q5).
+  const savedInLink = DOC_IN_LINK;
   const rendered = [];
   for (const [content, lazy] of items) {
     let task = null;
@@ -1227,6 +1263,7 @@ function parseList(L, i, e, out, refs, first) {
     rendered.push([sub, task]);
   }
   if (loose) {
+    DOC_IN_LINK = savedInLink;
     for (let q = 0; q < items.length; q++) {
       const sub = [];
       parseBlocks(items[q][0], 0, items[q][0].length, sub, refs, false, items[q][1], null, undefined, true);
