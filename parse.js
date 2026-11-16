@@ -629,14 +629,12 @@ function parseHtmlBlock(lines, i, e, top) {
     for (; j < e; j++) {
       if (lines[j].toLowerCase().indexOf(needle) >= 0) { j++; break; }
     }
-    // trailing newline kept unless a blank line follows (probe2g2:
-    // html-para and html-eof both end with \n; only a following blank
-    // line drops it). A TAB-only line is NOT blank for this rule — like
-    // the table rule, marked treats tab lines as content (doc-15: -->
-    // followed by a tab-only line keeps the \n). Covers a block ending
-    // at the end of a quote/list inner array (doc-19) as well as EOF.
+    // Trailing newline kept unless the next line is TRULY EMPTY (probe2l1:
+    // a spaces-only or tab-only blank line after the block keeps the \n;
+    // only an empty line drops it). Covers a block ending at the end of a
+    // quote/list inner array (doc-19) as well as EOF.
     const text = lines.slice(i, j).join('\n');
-    const nextBlank = j < e && isBlank(lines[j]) && lines[j].indexOf('\t') < 0;
+    const nextBlank = j < e && lines[j] === '';
     return [j < e && (!nextBlank || (top && j === e - 1 && lines[j] === '')) ? text + '\n' : text, j];
   }
   for (; j < e; j++) {
@@ -689,7 +687,7 @@ function parseBlocks(L, s, e, out, refs, tight, lazy, looseOut, top, inItem) {
       const al = matchDelimRow(L[i + 1]);
       if (al && countCells(line) === al.length) { i = parseTable(L, i, e, out, refs); continue; }
     }
-    i = parseParagraph(L, i, e, out, refs, tight, lazy, inItem);
+    i = parseParagraph(L, i, e, out, refs, tight, lazy, inItem, top);
   }
   return i;
 }
@@ -723,11 +721,27 @@ function interruptsPara(L, j, e, inItem) {
   return false;
 }
 
-function parseParagraph(L, i, e, out, refs, tight, lazy, inItem) {
+function parseParagraph(L, i, e, out, refs, tight, lazy, inItem, top) {
   let j = i + 1;
   while (j < e) {
     const line = L[j];
-    if (isBlank(line)) break;
+    if (isBlank(line)) {
+      // A spaces-only line with no \n after it in marked's lexed string is
+      // paragraph content, not a separator (cm-241: ">  " strips to " ",
+      // kept as "foo\n "). Top level: only the very last line qualifies.
+      // Inner arrays (quote/list): the trailing '' is artificial (pushed
+      // by parseQuote/parseList), so a spaces-only line followed only by
+      // '' lines qualifies.
+      if (line.length > 0) {
+        if (j === e - 1) { j++; break; }
+        if (!top) {
+          let allEmpty = true;
+          for (let k = j + 1; k < e; k++) if (L[k] !== '') { allEmpty = false; break; }
+          if (allEmpty) { j++; break; }
+        }
+      }
+      break;
+    }
     const [ind, ci] = indentInfo(line);
     if (ind <= 3 && setextKind(line, ci) > 0 && !(lazy && lazy[j])) break;
     // marked's paragraph lookahead stops before any line followed by a
@@ -782,8 +796,23 @@ function parseFenced(L, i, e, out, f, ind) {
       if (ok) { closed = true; break; }
     }
   }
+  // marked's Dt (indentCodeCompensation): ONLY backtick fences get indent
+  // compensation, and it is a CHARACTER-count slice — min(content line's
+  // leading-ws run length, opener's leading-ws run length) — not
+  // column-based. Tilde fences get NO strip at all (doc-29). A tab counts
+  // as ONE char here, so "\t\t" content under a 2-space opener loses both
+  // tabs (doc-17/13: the 42-fence opener "   ```" strips the tab fully).
   const content = [];
-  for (let k = i + 1; k < j; k++) content.push(ind > 0 ? stripIndent(L[k], ind) : L[k]);
+  if (c === 96) {
+    const sLen = indentInfo(L[i])[1];
+    if (sLen > 0) {
+      for (let k = i + 1; k < j; k++) {
+        const line = L[k];
+        const wLen = indentInfo(line)[1];
+        content.push(wLen > 0 ? line.slice(Math.min(wLen, sLen)) : line);
+      }
+    } else for (let k = i + 1; k < j; k++) content.push(L[k]);
+  } else for (let k = i + 1; k < j; k++) content.push(L[k]);
   let text = content.join('\n');
   if (content.length && content[content.length - 1] !== '') text += '\n';
   const lang = info === '' ? '' : ' class="language-' + escText(unescBS(info.split(/\s+/)[0])) + '"';
@@ -1003,6 +1032,36 @@ function parseQuote(L, i, e, out, refs) {
 }
 
 // ---------- lists ----------
+// Does the item content end inside an unclosed fenced code block? Scans
+// the content lines as parseBlocks sees them: a fence opens on a
+// non-lazy, non-code-merged line (indent < 4, not a quote line) matching
+// matchFence, and closes per parseFenced's closer rule (lazy lines CAN
+// close). Guards the code-merge: fence content keeps its indent (doc-02
+// "indented four" lost 4 columns to a merge after a lazy fence line).
+function endsInFence(content, lazy) {
+  let fence = null;
+  for (let k = 0; k < content.length; k++) {
+    const line = content[k];
+    if (fence) {
+      const [ci2, cj] = indentInfo(line);
+      if (ci2 <= 3 && line.charCodeAt(cj) === fence[0]) {
+        let m = 0, q = cj;
+        while (line.charCodeAt(q) === fence[0]) { m++; q++; }
+        let ok = m >= fence[1];
+        while (ok && q < line.length) { const d = line.charCodeAt(q); if (d !== 32 && d !== 9) ok = false; q++; }
+        if (ok) fence = null;
+      }
+      continue;
+    }
+    if (lazy[k]) continue;
+    const [ind3, ci3] = indentInfo(line);
+    if (ind3 >= 4 || line.charCodeAt(ci3) === 62) continue;
+    const f = matchFence(line, ci3);
+    if (f) fence = [f[0], f[1]];
+  }
+  return fence !== null;
+}
+
 function parseList(L, i, e, out, refs, first) {
   const ord = first[0], ch = first[1];
   const items = [];
@@ -1056,7 +1115,7 @@ function parseList(L, i, e, out, refs, first) {
         // columns stripped (marked's code-merge). Inside a nested list or
         // quote the inner container applies its own strip instead.
         const [rind] = indentInfo(stripped);
-        if (rind >= 4 && lastInnerIsPara(content, lazy) && lastInnerDirectPara(content, lazy)) {
+        if (rind >= 4 && !endsInFence(content, lazy) && lastInnerIsPara(content, lazy) && lastInnerDirectPara(content, lazy)) {
           content.push(stripIndentTab(stripped, 4));
           lazy.push(2);
         } else {
@@ -1066,16 +1125,45 @@ function parseList(L, i, e, out, refs, first) {
         j++;
         continue;
       }
-      // lazy continuation of the item's paragraph: marked keeps the raw
-      // line; >= 4 indent is a code-merge (4 columns stripped). Marked
-      // rejects a lazy line when the previous item line (after the
-      // item-indent strip) starts its content at column >= 4 — exactly
-      // what a code-merged line had before its strip.
+      // Lazy continuation (marked's list rule — no paragraph requirement):
+      // a dedented line joins the item unless (a) there is no previous
+      // content line (bare marker), (b) the previous line was code-merged
+      // (its pre-strip content started at column >= 4), (c) the previous
+      // content line starts at column >= 4, or (d) the previous content
+      // line is a fence/heading/html/hr begin (indent <= min(3, cCol-1)).
+      // A lazy line after fence CONTENT is included (doc-02) — only a
+      // lazy line right after the fence OPENER is blocked.
       let pc = content.length - 1;
       while (pc >= 0 && isBlank(content[pc])) pc--;
-      if (pc < 0 || lazy[pc] !== 2) if (lastInnerIsPara(content, lazy) && !interruptsPara(L, j, e, true) && parseDef(ln, null) === null) {
+      let blocked = pc < 0 || lazy[pc] === 2;
+      if (!blocked) {
+        let mPrev = content[pc];
+        if (lazy[pc] === true) {
+          // raw lazy line: marked slices R chars off the tab-expanded
+          // line, which can cut into the text (never >= 4 indent after)
+          let ex = '', col = 0, qi = 0;
+          while (qi < mPrev.length) {
+            const cc = mPrev.charCodeAt(qi);
+            if (cc === 32) { ex += ' '; col++; qi++; }
+            else if (cc === 9) { const w = 4 - (col % 4); ex += ' '.repeat(w); col += w; qi++; }
+            else break;
+          }
+          mPrev = (ex + mPrev.slice(qi)).slice(cCol);
+        } else if (mPrev.replace(/\t/g, '    ').search(/[^ ]/) >= 4) blocked = true;
+        if (!blocked) {
+          const [pind2, pci] = indentInfo(mPrev);
+          if (pind2 <= Math.max(0, Math.min(3, cCol - 1))) {
+            const pch = mPrev.charCodeAt(pci);
+            if (pch === 96 || pch === 126) { if (matchFence(mPrev, pci)) blocked = true; }
+            else if (pch === 35) { if (matchATX(mPrev, pci)) blocked = true; }
+            else if (pch === 60) { const hk = htmlBlockKind(mPrev, pci)[0]; if (hk >= 1 && hk <= 6) blocked = true; }
+            else if (pch === 45 || pch === 43 || pch === 42 || pch === 95) { if (isHR(mPrev, pci)) blocked = true; }
+          }
+        }
+      }
+      if (!blocked && !interruptsPara(L, j, e, true) && parseDef(ln, null) === null) {
         const [lind] = indentInfo(ln);
-        if (lind >= 4) { content.push(stripIndentTab(ln, 4)); lazy.push(2); }
+        if (lind >= 4 && !endsInFence(content, lazy)) { content.push(stripIndentTab(ln, 4)); lazy.push(2); }
         else { content.push(ln); lazy.push(true); }
         j++;
         continue;
