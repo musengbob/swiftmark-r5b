@@ -982,8 +982,11 @@ function parseQuote(L, i, e, out, refs) {
     // indented >= 4 is lexed as indented code merged into the paragraph,
     // with 4 columns stripped (marked's code-merge in blockTokens).
     if (lastInnerIsPara(inner, lazy) && !interruptsPara(L, j, e) && parseDef(line, null) === null) {
-      const [lind] = indentInfo(line);
-      if (lind >= 4) { inner.push(stripIndentTab(line, 4)); lazy.push(2); }
+      const [lind, lci] = indentInfo(line);
+      // marked neutralizes a setext-looking lazy line with 4 spaces
+      // (blockquoteSetextReplace); without it cm-093 regresses.
+      if (lind <= 3 && setextKind(line, lci) > 0) { inner.push('    ' + line.slice(lci)); lazy.push(true); }
+      else if (lind >= 4) { inner.push(stripIndentTab(line, 4)); lazy.push(2); }
       else { inner.push(line); lazy.push(true); }
       j++;
       continue;
