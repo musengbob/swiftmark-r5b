@@ -204,6 +204,17 @@ function finishMarker(line, ci, col, ord, ch, num, mw) {
 }
 
 // ---------- reference definitions ----------
+// True if s contains a `[` not escaped by an odd run of backslashes.
+function hasUnescapedBracket(s) {
+  for (let q = 0; q < s.length; q++) {
+    if (s[q] !== '[') continue;
+    let n = 0;
+    while (q - 1 - n >= 0 && s[q - 1 - n] === '\\') n++;
+    if (n % 2 === 0) return true;
+  }
+  return false;
+}
+
 // Try to parse a definition starting at `line` (title may be on `nextLine`).
 // Returns [linesConsumed, label, dest, title] or null.
 function parseDef(line, nextLine) {
@@ -217,6 +228,7 @@ function parseDef(line, nextLine) {
   if (close < 0 || close === i + 1) return null;
   const labelRaw = line.slice(i + 1, close);
   if (labelRaw.length > 999) return null;
+  if (hasUnescapedBracket(labelRaw)) return null;
   if (line[close + 1] !== ':') return null;
   let j = close + 2;
   while (j < line.length && (line[j] === ' ' || line[j] === '\t')) j++;
@@ -227,6 +239,7 @@ function parseDef(line, nextLine) {
     if (gt < 0) return null;
     dest = line.slice(j + 1, gt);
     if (dest.indexOf('<') >= 0) return null;
+    if (/[\x00-\x1f\x7f]/.test(dest)) return null;
     j = gt + 1;
   } else {
     let depth = 0, k = j;
@@ -242,9 +255,10 @@ function parseDef(line, nextLine) {
     dest = line.slice(j, k);
     j = k;
   }
-  const label = labelRaw.replace(/\s+/g, ' ').trim().toLowerCase();
+  const label = normLabel(labelRaw);
   let k = j;
   while (k < line.length && (line[k] === ' ' || line[k] === '\t')) k++;
+  if (k < line.length && k === j) return null; // title needs whitespace after dest
   if (k >= line.length) {
     if (nextLine != null) {
       const t = parseTitleLine(nextLine);
@@ -827,7 +841,8 @@ function unescBS(s) {
 }
 
 function normLabel(s) {
-  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+  // CommonMark label folding: lower->upper->lower folds ß→ss, ligatures, etc.
+  return s.replace(/\s+/g, ' ').trim().toLowerCase().toUpperCase().toLowerCase();
 }
 
 // Raw dest -> final href (null only on lone surrogates).
@@ -879,6 +894,11 @@ function findCloseBracket(src, i) {
       if (found >= 0) { j = found + m; continue; }
       j += m; continue;
     }
+    if (cc === 60) { // skip autolinks / inline HTML: `]` inside never closes
+      const A = tryAutolink(src, j) || tryHtml(src, j);
+      if (A) { j = A.end; continue; }
+      j++; continue;
+    }
     if (cc === 91) { depth++; j++; continue; }
     if (cc === 93) {
       if (depth === 0) return j;
@@ -911,6 +931,7 @@ function parseInlineDest(src, i) {
       const cc = src.charCodeAt(k);
       if (cc === 92 && k + 1 < n && ASCII_PUNCT.has(src[k + 1])) { k += 2; continue; }
       if (cc === 60) return null;
+      if (cc === 10 || cc < 32 || cc === 127) return null; // <> dest rejects \n/controls
       if (cc === 62) { found = k; break; }
       k++;
     }
@@ -932,9 +953,11 @@ function parseInlineDest(src, i) {
     dest = src.slice(j, k);
     j = k;
   }
+  const j0 = j;
   j = skipInlineWs(src, j);
   let title = '';
   const qc = src.charCodeAt(j);
+  if ((qc === 34 || qc === 39 || qc === 40) && j === j0) return null; // title needs ws after dest
   if (qc === 34 || qc === 39 || qc === 40) { // " ' (
     const q = src[j], closeQ = q === '(' ? ')' : q;
     let k = j + 1, t = '', found = false;
@@ -971,8 +994,11 @@ function tryLink(src, i, refs, img) {
   const after = close + 1;
   if (src.charCodeAt(after) === 40) { // inline
     const d = parseInlineDest(src, after + 1);
-    if (!d) return null;
-    return makeLink(text, procHref(d.href), procTitle(d.title), d.end, refs, img);
+    if (d) return makeLink(text, procHref(d.href), procTitle(d.title), d.end, refs, img);
+    // inline-dest failure falls back to shortcut reference
+    const ref0 = refs.get(normLabel(text));
+    if (!ref0) return null;
+    return makeLink(text, procHref(ref0.href), unesc(ref0.title), close + 1, refs, img);
   }
   if (src.charCodeAt(after) === 91) { // full / collapsed ref
     let j = after + 1, labelEnd = -1;
@@ -989,6 +1015,7 @@ function tryLink(src, i, refs, img) {
     }
     let label = src.slice(after + 1, labelEnd);
     if (label === '') label = text;
+    else if (hasUnescapedBracket(label)) return null;
     const ref = refs.get(normLabel(label));
     if (!ref) return null; // no shortcut fallback
     return makeLink(text, procHref(ref.href), unesc(ref.title), labelEnd + 1, refs, img);
@@ -1023,10 +1050,10 @@ function tryAutolink(src, i) {
       const c = inner.charCodeAt(k);
       if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 43 || c === 46 || c === 45)) ok = false;
     }
-    if (ok) return { href: procHref(inner), text: inner, end: j + 1 };
+    if (ok) return { href: encodeHref(inner), text: inner, end: j + 1 };
   }
   if (EMAIL_FULL.test(inner)) {
-    return { href: procHref('mailto:' + inner), text: inner, end: j + 1 };
+    return { href: encodeHref('mailto:' + inner), text: inner, end: j + 1 };
   }
   return null;
 }
@@ -1034,7 +1061,7 @@ function tryAutolink(src, i) {
 // Try inline HTML at src[i] === '<'. Returns {s, end} or null.
 function tryHtml(src, i) {
   if (src.startsWith('<!--', i)) {
-    const e = src.indexOf('-->', i + 4);
+    const e = src.indexOf('-->', i + 2);
     return e >= 0 ? { s: src.slice(i, e + 3), end: e + 3 } : null;
   }
   if (src.startsWith('<![CDATA[', i)) {
@@ -1064,6 +1091,7 @@ function tryHtml(src, i) {
 function tryDel(src, i, refs) {
   let m = 1;
   while (src.charCodeAt(i + m) === 126) m++;
+  if (m > 2) return null; // opening run is at most ~~
   const after = src[i + m];
   if (after === undefined || isSpaceCh(after)) return null;
   const n = src.length;
@@ -1083,7 +1111,7 @@ function tryDel(src, i, refs) {
 
 // ---------- GFM www / email autolinks (post-scan pass over text tokens) ----------
 const URL_STICKY = /(?:(?:https?|ftp):\/\/|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
-const EMAIL_STICKY = /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+/y;
+const EMAIL_STICKY = /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![a-zA-Z0-9-_])/y;
 const EMAIL_LOCAL_CHARS = new Set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&\'*+/=?^_`{|}~-'.split(''));
 const WWW_PREV_OK = new Set([' ', '\t', '\n', '\r', '\f', '\v', '(', '*', '_', '~']);
 const TRAIL_PUNCT = /[?!.,:;*_~]+$/;
@@ -1094,6 +1122,7 @@ function backpedal(u) {
   let prev;
   do {
     prev = u;
+    u = u.replace(/&[a-zA-Z0-9]+;$/, ''); // drop trailing entity-like tail
     let open = 0, close = 0;
     for (let k = 0; k < u.length; k++) {
       if (u[k] === '(') open++;
@@ -1250,6 +1279,11 @@ function linkifyTokens(toks) {
       EMAIL_STICKY.lastIndex = ls;
       const m = EMAIL_STICKY.exec(s);
       if (!m || m.index + m[0].length <= idx) { pos = idx + 1; continue; }
+      // the lookahead char may live in the next token (a `_` delimiter run)
+      if (m.index + m[0].length === s.length && ti + 1 < toks.length) {
+        const nx = toks[ti + 1];
+        if (typeof nx === 'object' && nx.t === 1 && nx.c === '_') { pos = idx + 1; continue; }
+      }
       let pre = '';
       if (m.index === emitFrom && emitFrom === 0) {
         let k = ti - 1;
@@ -1262,10 +1296,30 @@ function linkifyTokens(toks) {
           } else break;
         }
       }
-      if (m.index > emitFrom) segs.push(s.slice(emitFrom, m.index));
+      // mailto:/xmpp: immediately before the email makes one link; xmpp
+      // also takes one path segment. The scheme must not follow a word char.
+      let linkStart = m.index, scheme = '';
+      for (const sch of ['mailto:', 'xmpp:']) {
+        const ss = m.index - sch.length;
+        if (ss >= emitFrom && ss >= 0 && s.slice(ss, m.index) === sch) {
+          const pc = ss === 0 ? prevChar : s[ss - 1];
+          if (pc === '' || !/[A-Za-z0-9]/.test(pc)) { linkStart = ss; scheme = sch; break; }
+        }
+      }
+      let path = '';
+      if (scheme === 'xmpp:') {
+        const pe = m.index + m[0].length;
+        if (s[pe] === '/') {
+          const pm = /^\/[A-Za-z0-9@.]+/.exec(s.slice(pe));
+          if (pm) path = pm[0];
+        }
+      }
+      if (linkStart > emitFrom) segs.push(s.slice(emitFrom, linkStart));
       const email = pre + m[0];
-      segs.push({ t: 10, href: procHref('mailto:' + email), text: email });
-      pos = emitFrom = m.index + m[0].length;
+      const full = scheme + email + path;
+      const href = scheme === 'xmpp:' ? 'xmpp:' + email + path : 'mailto:' + email;
+      segs.push({ t: 10, href: procHref(href), text: full });
+      pos = emitFrom = m.index + m[0].length + path.length;
       curPrev = ''; found = true;
     }
     if (!found) continue;
@@ -1456,6 +1510,21 @@ function processEm(toks) {
   }
 }
 
+// Plain-text rendering for image alt text: nested images/links contribute
+// their text; HTML tags and hard breaks contribute nothing.
+function renderPlainText(toks) {
+  let out = '';
+  for (const t of toks) {
+    if (typeof t === 'string') out += escText(t);
+    else if (t.t === 0) out += escText(t.s);
+    else if (t.t === 1) out += t.c.repeat(t.n);
+    else if (t.t === 2) out += escRaw(t.s);
+    else if (t.t === 5 || t.t === 6 || t.t === 7 || t.t === 8) out += renderPlainText(t.kids);
+    else if (t.t === 10) out += escRaw(t.text);
+  }
+  return out;
+}
+
 function renderInline(toks) {
   let out = '';
   for (const t of toks) {
@@ -1468,15 +1537,15 @@ function renderInline(toks) {
     else if (t.t === 6) {
       if (t.href === null) out += renderInline(t.kids);
       else {
-        out += '<a href="' + escRaw(t.href) + '"';
-        if (t.title) out += ' title="' + escRaw(t.title) + '"';
+        out += '<a href="' + escText(t.href) + '"';
+        if (t.title) out += ' title="' + escText(t.title) + '"';
         out += '>' + renderInline(t.kids) + '</a>';
       }
     } else if (t.t === 7) {
       if (t.src === null) out += renderInline(t.kids);
       else {
-        out += '<img src="' + escRaw(t.src) + '" alt="' + stripTags(renderInline(t.kids)) + '"';
-        if (t.title) out += ' title="' + escRaw(t.title) + '"';
+        out += '<img src="' + escText(t.src) + '" alt="' + renderPlainText(t.kids) + '"';
+        if (t.title) out += ' title="' + escText(t.title) + '"';
         out += '>';
       }
     } else if (t.t === 8) out += '<del>' + renderInline(t.kids) + '</del>';
