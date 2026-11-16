@@ -1659,12 +1659,17 @@ function spanUrl(toks, ti, ext0) {
 // Split string tokens on www./http/email autolinks. Runs before processEm.
 // URL matches may span following delimiter/escape/text tokens (marked's
 // greedy tail swallows `*` etc.); email local parts may span preceding
-// delimiter tokens (`_foo@bar.com`).
+// delimiter tokens (`_foo@bar.com`). `gated` holds PRE-linkify token
+// indices, but splices shift indices as earlier tokens expand (doc-36:
+// the www splice moved the URL token onto the stale gated index of the
+// <a>-inner "top" token, wrongly suppressing it) — so track the original
+// index of the current token separately.
 function linkifyTokens(toks, gated) {
-  for (let ti = 0; ti < toks.length; ti++) {
+  let orig = 0; // original (pre-splice) index of toks[ti]
+  for (let ti = 0; ti < toks.length; ti++, orig++) {
     const t = toks[ti];
     if (typeof t !== 'string') continue;
-    if (gated && gated.has(ti)) continue; // scanned while inside <a>
+    if (gated && gated.has(orig)) continue; // scanned while inside <a>
     const s = t;
     let prevChar = '';
     if (ti > 0) {
@@ -1792,6 +1797,7 @@ function linkifyTokens(toks, gated) {
     for (const [rel, raw] of fwdLits) toks[ti + rel - fwdDrop] = raw;
     toks.splice(ti, 1, ...segs);
     ti += segs.length - 1;
+    orig += fwdDrop; // fwdDrop following original tokens were consumed
   }
 }
 
@@ -1827,11 +1833,14 @@ const LINK_SPAN_STICKY = /\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\\(
 const CODE_SPAN_NORM_RE = /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g;
 
 function inlineTokens(src, refs, inLink) {
-  // marked's inLink is per-block inline-lexing state: an unclosed <a> in
-  // one paragraph does NOT suppress autolinks in later paragraphs
-  // (probe2g3: marked links www after an unclosed-<a> paragraph; doc-31
-  // regressed when the flag leaked across paragraphs). Reset per call.
-  if (!inLink) DOC_IN_LINK = false;
+  // marked's inLink is DOCUMENT state (Lexer.state, toggled by the inline
+  // tag tokenizer, processed in document order via the inline queue): an
+  // unclosed inline <a ...> suppresses bare-URL/email autolinks in LATER
+  // paragraphs too (probe2n5 IP1/IP2/IP4/IP6 — docs 03/06/30/33), until a
+  // later </a> clears it. Do NOT reset per call. (Earlier per-call reset
+  // was based on probe2g3, whose lone-<a> line was an HTML block, never
+  // inline-tokenized, so inLink never toggled there.) Reset only in
+  // parse(). Nested link-text calls (inLink) never toggle.
   const toks = [];
   const gated = new Set();
   const n = src.length;
@@ -1953,8 +1962,11 @@ function inlineTokens(src, refs, inLink) {
         // link; toggling first gated it wrongly).
         flush(i);
         if (!inLink) {
-          if (/^<a[\s>]/i.test(H.s)) DOC_IN_LINK = true;
-          else if (/^<\/a[\s>]/i.test(H.s)) DOC_IN_LINK = false;
+          // marked's exact rules: startATag /^<a /i" (bare <a> does NOT
+          // set it, probe2n5 IP3), endATag "/^<\/a>/i" ("</a >" does NOT
+          // clear it, probe2n5 IP5).
+          if (/^<a /i.test(H.s)) DOC_IN_LINK = true;
+          else if (/^<\/a>/i.test(H.s)) DOC_IN_LINK = false;
         }
         toks.push({ t: 9, s: H.s });
         i = H.end; start = i; continue;
