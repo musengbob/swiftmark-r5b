@@ -1317,11 +1317,24 @@ function findCloseBracket(src, i) {
       // marked's label regex pairs a backtick run with the NEXT backtick
       // run of ANY length as a code-span unit (`` a ` b `` pairs the
       // opening `` with the middle `); a run with no following run kills
-      // the label, except a run of 2+ immediately before `]`.
+      // the label, except a run of 2+ immediately before `]`. The pairing
+      // search is bounded by the label's closing `]`: marked backtracks,
+      // so a run whose next backtick lies PAST the `]` is unpaired, and
+      // the ``+(?=]) alternative saves a 2+ run there (doc-33: the
+      // trailing `` paired with a backtick in a later paragraph line).
       let m = 1;
       while (src.charCodeAt(j + m) === 96) m++;
       const b = src.indexOf('`', j + m);
-      if (b < 0) {
+      let c = -1, dd = depth, q = j + m;
+      const lim = b < 0 ? n : b;
+      while (q < lim) {
+        const x = src.charCodeAt(q);
+        if (x === 92) { q += 2; continue; }
+        if (x === 91) { dd++; q++; continue; }
+        if (x === 93) { if (dd === 0) { c = q; break; } dd--; q++; continue; }
+        q++;
+      }
+      if (c >= 0 || b < 0) {
         if (m >= 2 && src.charCodeAt(j + m) === 93) { j += m; continue; }
         return -1;
       }
@@ -1539,17 +1552,24 @@ function tryDel(src, i, refs, inLink) {
     if (b < 0) return null;
     let r = 1;
     while (src.charCodeAt(b + r) === 126) r++;
-    if (r === m) {
-      const before = src[b - 1] ?? '', afterC = src[b + r] ?? '';
+    // r>m: only an escaped first tilde closes (marked: `\~~~` → the escape
+    // consumes tilde 1, the last m tildes close; doc-15). Plain r>m runs
+    // never close (probe2o2: `~~b ~~~ c`, `~~b \~~~~ c` stay literal).
+    let bs = 0;
+    while (src[b - 1 - bs] === '\\') bs++;
+    const esc = r === m + 1 && bs % 2 === 1;
+    if (r === m || esc) {
+      const cs = esc ? b + 1 : b; // closer window start (last m tildes)
+      const before = src[cs - 1] ?? '', afterC = src[b + r] ?? '';
       const bSpace = isSpaceCh(before), bPunct = isPunctCh(before);
       const aSpace = isSpaceCh(afterC), aPunct = isPunctCh(afterC);
       const aPlain = !aSpace && !aPunct && afterC !== '';
       const isOpener = ((bSpace || bPunct) && aPlain) || (bSpace && aPunct);
-      if (isOpener) depth += r;
+      if (isOpener) depth += m;
       else if (!(bSpace && aSpace)) {
-        depth -= r;
+        depth -= m;
         if (depth <= 0) {
-          return { kids: inlineTokens(src.slice(i + m, b), refs, inLink), end: b + m };
+          return { kids: inlineTokens(src.slice(i + m, cs), refs, inLink), end: b + r };
         }
       }
     }
@@ -1831,6 +1851,16 @@ let DOC_IN_LINK = false;
 // to '+' first (anyPunctuationOutsideCode).
 const LINK_SPAN_STICKY = /\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\\()]|\((?:\\[\s\S]|[^\\()])*\))*\)/y;
 const CODE_SPAN_NORM_RE = /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g;
+// marked's anyPunctuationOutsideCode, verbatim (single pass: code-span
+// alternative first, then bare run, then escape — the bare-run alternative
+// CONSUMES failed runs so a later match can't start mid-run; a separate
+// code-span-only pass over-matches and over-masks, doc-26/doc-06).
+const MASK_NORM_RE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])/g;
+// marked's blockSkip code alternative: a backtick run pairs with the next
+// SAME-length run (content has no backticks). On the normalized source this
+// finds phantom code spans — e.g. a lone ` inside a link label pairing
+// with a later ` — which marked's #n mask hides from emStrong (doc-28).
+const MASK_CODE_RE = /(?<!`)(`+)[^`]+\1(?!`)/g;
 
 function inlineTokens(src, refs, inLink) {
   // marked's inLink is DOCUMENT state (Lexer.state, toggled by the inline
@@ -1846,6 +1876,30 @@ function inlineTokens(src, refs, inLink) {
   const n = src.length;
   let i = 0, start = 0;
   let normSrc = null, maskEnd = -1; // lazy emStrong-mask state (see below)
+  let maskSpans = null, maskIdx = 0; // phantom code-span intervals [s, e)
+  const ensureMask = () => {
+    if (maskSpans !== null) return;
+    maskSpans = [];
+    if (normSrc === null) {
+      // marked's anyPunctuationOutsideCode replacer: escape -> '+'s,
+      // code span -> inner backticks '+', bare run unchanged (same length).
+      normSrc = src.includes('`')
+        ? src.replace(MASK_NORM_RE, (m, r, e) => e ? '+'.repeat(m.length) : r ? r + m.slice(r.length, -r.length).replace(/`/g, '+') + r : m)
+        : src;
+    }
+    // Phantom spans need a backtick consumed by a link/image/HTML token;
+    // plain code spans pair identically in both implementations.
+    if (!src.includes('`') || (!src.includes('[') && !src.includes('<'))) return;
+    MASK_CODE_RE.lastIndex = 0;
+    let cm;
+    while ((cm = MASK_CODE_RE.exec(normSrc)) !== null) maskSpans.push([cm.index, cm.index + cm[0].length]);
+  };
+  // i increases monotonically in the main loop, so a shared pointer works.
+  const inCodeMask = (pos) => {
+    ensureMask();
+    while (maskIdx < maskSpans.length && maskSpans[maskIdx][1] <= pos) maskIdx++;
+    return maskIdx < maskSpans.length && maskSpans[maskIdx][0] <= pos;
+  };
   const flush = (to) => { if (to > start) { if (DOC_IN_LINK) gated.add(toks.length); toks.push(src.slice(start, to)); } };
   while (i < n) {
     const cc = src.charCodeAt(i);
@@ -1901,7 +1955,10 @@ function inlineTokens(src, refs, inLink) {
       }
       if (canOpen || canClose) {
         flush(i);
-        toks.push({ t: 1, c: ch, n: m, o: canOpen, cl: canClose });
+        // mk: inside a phantom code span (marked's #n mask) — can open
+        // (LDelim runs on the real src) but can never close (scanCloser
+        // runs on the masked src). See ensureMask / doc-28.
+        toks.push({ t: 1, c: ch, n: m, o: canOpen, cl: canClose, mk: inCodeMask(i) });
         i += m; start = i; continue;
       }
       i += m; continue; // not a delimiter: leave the run in the text
@@ -1928,11 +1985,7 @@ function inlineTokens(src, refs, inLink) {
       // tryLink failed: if this starts a blockSkip-style link span, mask
       // emphasis/del delimiters inside it (marked's #n masking).
       if (src.includes('](')) {
-        if (normSrc === null) {
-          normSrc = src.includes('`')
-            ? src.replace(CODE_SPAN_NORM_RE, (m, r, inner) => r + inner.replace(/`/g, '+') + r)
-            : src;
-        }
+        ensureMask();
         LINK_SPAN_STICKY.lastIndex = i;
         const lm = LINK_SPAN_STICKY.exec(normSrc);
         if (lm) maskEnd = Math.max(maskEnd, i + lm[0].length);
@@ -2067,11 +2120,12 @@ function findSkipRun(toks, j, ch) {
   const transparent = (t) => {
     if (typeof t === 'string') return !t.includes('*') && !t.includes('_');
     if (t.t === 0 || t.t === 3 || t.t === 6 || t.t === 7) return true;
+    if (t.t === 1 && t.mk) return true; // masked delimiter: invisible
     if (t.t === 2 || t.t === 9) return !t.s.includes('*') && !t.s.includes('_');
     if (t.t === 10) return !t.text.includes('*') && !t.text.includes('_');
     return false;
   };
-  const skipText = () => { while (i < toks.length && (typeof toks[i] !== 'object' || toks[i].t !== 1)) { if (!transparent(toks[i])) return false; i++; } return true; };
+  const skipText = () => { while (i < toks.length && (typeof toks[i] !== 'object' || toks[i].t !== 1 || toks[i].mk)) { if (!transparent(toks[i])) return false; i++; } return true; };
   if (!skipText() || i >= toks.length) return -1;
   const first = toks[i];
   if (first.c !== other || first.n !== 2) return -1;
@@ -2092,6 +2146,7 @@ function scanCloser(toks, j, ch, kk, y, R, o, skipIdx) {
     if (i === skipIdx) continue;
     const r = toks[i];
     if (typeof r !== 'object' || r.t !== 1 || r.c !== ch || r.n <= 0) continue;
+    if (r.mk) continue; // masked (phantom code span): invisible to closers
     const b = r.n;
     const g = classifyRun(r.pv, r.nx, ch);
     if (g === 0) continue;
@@ -2156,7 +2211,7 @@ function processEm(toks) {
     const closer = toks[i];
     const b = closer.n;
     const kids = [];
-    if (kkUsed > use) kids.push({ t: 1, c: ch, n: kkUsed - use, o: true, cl: true });
+    if (kkUsed > use) kids.push({ t: 1, c: ch, n: kkUsed - use, o: true, cl: true, mk: t.mk });
     for (let q = j + 1; q < i; q++) kids.push(toks[q]);
     if (bConsumed > use) kids.push({ t: 1, c: ch, n: bConsumed - use, o: true, cl: true });
     processEm(kids);
