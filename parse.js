@@ -452,8 +452,12 @@ function htmlBlockKind(line, ci) {
   if (tag === 'script' || tag === 'pre' || tag === 'style' || tag === 'textarea') {
     return [1, '</' + tag];
   }
-  // Type 7: a complete open/close tag alone on the line.
-  if (/^<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s+[^<>]*)?\/?>\s*$/.test(line.slice(ci))) {
+  // Type 7: a complete open/close tag alone on the line (strict tag pattern
+  // — quoted `>` counts, but an invalid attribute name does not).
+  const tagRe = line.charCodeAt(ci + 1) === 47 ? CLOSE_TAG_RE : OPEN_TAG_RE;
+  tagRe.lastIndex = ci;
+  const tm = tagRe.exec(line);
+  if (tm && /^[ \t]*$/.test(line.slice(ci + tm[0].length))) {
     if (BLOCK_TAGS.has(tag)) return [6, null];
     return [7, null];
   }
@@ -810,6 +814,471 @@ function parseTable(L, i, e, out, refs) {
   return j;
 }
 
+// ---------- inline link helpers ----------
+// Backslash-unescape: `\` + ASCII punct -> punct; lone `\` stays.
+function unescBS(s) {
+  if (s.indexOf('\\') < 0) return s;
+  let out = '', i = 0;
+  while (i < s.length) {
+    if (s[i] === '\\' && i + 1 < s.length && ASCII_PUNCT.has(s[i + 1])) { out += s[i + 1]; i += 2; }
+    else { out += s[i]; i++; }
+  }
+  return out;
+}
+
+function normLabel(s) {
+  return s.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// Raw dest -> final href (null only on lone surrogates).
+function procHref(raw) {
+  return encodeHref(unesc(unescBS(raw)));
+}
+
+// Raw inline title -> final title text (refs' titles are already unescaped).
+function procTitle(raw) {
+  return unesc(unescBS(raw));
+}
+
+function stripTags(html) {
+  return html.replace(/<[^>]*>/g, '');
+}
+
+// Does a token tree contain a bracket link (t:6)? Recurses into em/del
+// kids; NOT into image kids (a link in alt text never deactivates an
+// outer link) and autolinks (t:10) never count.
+function kidsContainLink(kids) {
+  for (const t of kids) {
+    if (typeof t !== 'object') continue;
+    if (t.t === 6) return true;
+    if ((t.t === 5 || t.t === 8) && kidsContainLink(t.kids)) return true;
+  }
+  return false;
+}
+
+// Find the `]` matching src[i] === '[' (balance counting; skips `\x`
+// escapes and code spans). Returns index or -1.
+function findCloseBracket(src, i) {
+  const n = src.length;
+  let depth = 0, j = i + 1;
+  while (j < n) {
+    const cc = src.charCodeAt(j);
+    if (cc === 92) { j += 2; continue; }
+    if (cc === 96) {
+      let m = 1;
+      while (src.charCodeAt(j + m) === 96) m++;
+      let k = j + m, found = -1;
+      while (k < n) {
+        const b = src.indexOf('`', k);
+        if (b < 0) break;
+        let r = 1;
+        while (src.charCodeAt(b + r) === 96) r++;
+        if (r === m) { found = b; break; }
+        k = b + r;
+      }
+      if (found >= 0) { j = found + m; continue; }
+      j += m; continue;
+    }
+    if (cc === 91) { depth++; j++; continue; }
+    if (cc === 93) {
+      if (depth === 0) return j;
+      depth--; j++; continue;
+    }
+    j++;
+  }
+  return -1;
+}
+
+function skipInlineWs(src, j) {
+  const n = src.length;
+  while (j < n) {
+    const c = src.charCodeAt(j);
+    if (c === 32 || c === 9 || c === 10) j++;
+    else break;
+  }
+  return j;
+}
+
+// Parse "(dest title)" starting at src[i] (just after '(').
+// Returns {href, title, end} with RAW href/title, or null.
+function parseInlineDest(src, i) {
+  const n = src.length;
+  let j = skipInlineWs(src, i);
+  let dest = '';
+  if (src.charCodeAt(j) === 60) { // <...>
+    let k = j + 1, found = -1;
+    while (k < n) {
+      const cc = src.charCodeAt(k);
+      if (cc === 92 && k + 1 < n && ASCII_PUNCT.has(src[k + 1])) { k += 2; continue; }
+      if (cc === 60) return null;
+      if (cc === 62) { found = k; break; }
+      k++;
+    }
+    if (found < 0) return null;
+    dest = src.slice(j + 1, found);
+    j = found + 1;
+  } else { // bare dest: balanced parens, no spaces/controls
+    let depth = 0, k = j;
+    while (k < n) {
+      const cc = src.charCodeAt(k);
+      if (cc === 32 || cc === 9 || cc === 10) break;
+      if (cc < 32 || cc === 127) break;
+      if (cc === 92 && k + 1 < n && ASCII_PUNCT.has(src[k + 1])) { k += 2; continue; }
+      if (cc === 40) { depth++; k++; continue; }
+      if (cc === 41) { if (depth === 0) break; depth--; k++; continue; }
+      k++;
+    }
+    if (depth !== 0) return null;
+    dest = src.slice(j, k);
+    j = k;
+  }
+  j = skipInlineWs(src, j);
+  let title = '';
+  const qc = src.charCodeAt(j);
+  if (qc === 34 || qc === 39 || qc === 40) { // " ' (
+    const q = src[j], closeQ = q === '(' ? ')' : q;
+    let k = j + 1, t = '', found = false;
+    while (k < n) {
+      const cc = src.charCodeAt(k);
+      if (cc === 92 && k + 1 < n) { t += src.slice(k, k + 2); k += 2; continue; }
+      if (src[k] === closeQ) { found = true; break; }
+      if (q === '(' && cc === 40) return null;
+      t += src[k]; k++;
+    }
+    if (!found) return null;
+    title = t;
+    j = skipInlineWs(src, k + 1);
+  }
+  if (src.charCodeAt(j) !== 41) return null;
+  return { href: dest, title, end: j + 1 };
+}
+
+// Build a link/image result from raw text + href/title. Links are
+// rejected when the text contains a nested bracket link; images are not.
+function makeLink(text, href, title, end, refs, img) {
+  const kids = inlineTokens(text, refs);
+  if (!img && kidsContainLink(kids)) return null;
+  return { end, href, title, kids };
+}
+
+// Try to parse a link (img=false) or image (img=true) starting at src[i]
+// ('[' or '!['). Returns {end, href, title, kids} or null.
+function tryLink(src, i, refs, img) {
+  const open = img ? i + 1 : i;
+  const close = findCloseBracket(src, open);
+  if (close < 0) return null;
+  const text = src.slice(open + 1, close);
+  const after = close + 1;
+  if (src.charCodeAt(after) === 40) { // inline
+    const d = parseInlineDest(src, after + 1);
+    if (!d) return null;
+    return makeLink(text, procHref(d.href), procTitle(d.title), d.end, refs, img);
+  }
+  if (src.charCodeAt(after) === 91) { // full / collapsed ref
+    let j = after + 1, labelEnd = -1;
+    while (j < src.length) {
+      const cc = src.charCodeAt(j);
+      if (cc === 92) { j += 2; continue; }
+      if (cc === 93) { labelEnd = j; break; }
+      j++;
+    }
+    if (labelEnd < 0) { // unclosed 2nd bracket: fall back to shortcut
+      const ref = refs.get(normLabel(text));
+      if (!ref) return null;
+      return makeLink(text, procHref(ref.href), unesc(ref.title), close + 1, refs, img);
+    }
+    let label = src.slice(after + 1, labelEnd);
+    if (label === '') label = text;
+    const ref = refs.get(normLabel(label));
+    if (!ref) return null; // no shortcut fallback
+    return makeLink(text, procHref(ref.href), unesc(ref.title), labelEnd + 1, refs, img);
+  }
+  const ref = refs.get(normLabel(text)); // shortcut
+  if (!ref) return null;
+  return makeLink(text, procHref(ref.href), unesc(ref.title), close + 1, refs, img);
+}
+
+// ---------- autolinks / inline HTML / strikethrough ----------
+const EMAIL_FULL = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+const OPEN_TAG_RE = /<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z_:][a-zA-Z0-9_.:-]*(?:\s*=\s*(?:[^ \t\n"'=<>`]+|'[^']*'|"[^"]*"))?)*\s*\/?>/y;
+const CLOSE_TAG_RE = /<\/[a-zA-Z][a-zA-Z0-9-]*\s*>/y;
+
+// Try a bracketed autolink at src[i] === '<'. Returns {href, text, end}.
+function tryAutolink(src, i) {
+  let j = i + 1;
+  const n = src.length;
+  while (j < n) {
+    const cc = src.charCodeAt(j);
+    if (cc === 62) break;
+    if (cc === 32 || cc === 9 || cc === 10 || cc === 60) return null;
+    j++;
+  }
+  if (j >= n || j === i + 1) return null;
+  const inner = src.slice(i + 1, j);
+  const colon = inner.indexOf(':');
+  if (colon >= 2 && colon <= 32 && colon + 1 < inner.length) {
+    const c0 = inner.charCodeAt(0);
+    let ok = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122);
+    for (let k = 1; ok && k < colon; k++) {
+      const c = inner.charCodeAt(k);
+      if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 43 || c === 46 || c === 45)) ok = false;
+    }
+    if (ok) return { href: procHref(inner), text: inner, end: j + 1 };
+  }
+  if (EMAIL_FULL.test(inner)) {
+    return { href: procHref('mailto:' + inner), text: inner, end: j + 1 };
+  }
+  return null;
+}
+
+// Try inline HTML at src[i] === '<'. Returns {s, end} or null.
+function tryHtml(src, i) {
+  if (src.startsWith('<!--', i)) {
+    const e = src.indexOf('-->', i + 4);
+    return e >= 0 ? { s: src.slice(i, e + 3), end: e + 3 } : null;
+  }
+  if (src.startsWith('<![CDATA[', i)) {
+    const e = src.indexOf(']]>', i + 9);
+    return e >= 0 ? { s: src.slice(i, e + 3), end: e + 3 } : null;
+  }
+  if (src.startsWith('<?', i)) {
+    const e = src.indexOf('?>', i + 2);
+    return e >= 0 ? { s: src.slice(i, e + 2), end: e + 2 } : null;
+  }
+  if (src.charCodeAt(i + 1) === 33) { // <! + letter (declaration)
+    const c = src.charCodeAt(i + 2);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+      const e = src.indexOf('>', i + 2);
+      if (e >= 0) return { s: src.slice(i, e + 1), end: e + 1 };
+    }
+    return null;
+  }
+  const re = src.charCodeAt(i + 1) === 47 ? CLOSE_TAG_RE : OPEN_TAG_RE;
+  re.lastIndex = i;
+  const m = re.exec(src);
+  return m ? { s: m[0], end: i + m[0].length } : null;
+}
+
+// Try strikethrough at src[i] === '~'. The closing run must have EXACTLY
+// the opening run's length; content must start/end with a non-space char.
+function tryDel(src, i, refs) {
+  let m = 1;
+  while (src.charCodeAt(i + m) === 126) m++;
+  const after = src[i + m];
+  if (after === undefined || isSpaceCh(after)) return null;
+  const n = src.length;
+  let j = i + m + 1;
+  while (j < n) {
+    const b = src.indexOf('~', j);
+    if (b < 0) return null;
+    let r = 1;
+    while (src.charCodeAt(b + r) === 126) r++;
+    if (r === m && !isSpaceCh(src[b - 1])) {
+      return { kids: inlineTokens(src.slice(i + m, b), refs), end: b + m };
+    }
+    j = b + r;
+  }
+  return null;
+}
+
+// ---------- GFM www / email autolinks (post-scan pass over text tokens) ----------
+const URL_STICKY = /(?:(?:https?|ftp):\/\/|www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
+const EMAIL_STICKY = /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+/y;
+const EMAIL_LOCAL_CHARS = new Set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&\'*+/=?^_`{|}~-'.split(''));
+const WWW_PREV_OK = new Set([' ', '\t', '\n', '\r', '\f', '\v', '(', '*', '_', '~']);
+const TRAIL_PUNCT = /[?!.,:;*_~]+$/;
+
+// Trim a greedy URL match: cut at unmatched '(', drop unbalanced
+// trailing ')', trim trailing ?!.,:;*_~ (loop until stable).
+function backpedal(u) {
+  let prev;
+  do {
+    prev = u;
+    let open = 0, close = 0;
+    for (let k = 0; k < u.length; k++) {
+      if (u[k] === '(') open++;
+      else if (u[k] === ')') close++;
+    }
+    if (open > close) u = u.slice(0, u.lastIndexOf('('));
+    while (u.endsWith(')')) {
+      let o = 0, c = 0;
+      for (let k = 0; k < u.length; k++) {
+        if (u[k] === '(') o++;
+        else if (u[k] === ')') c++;
+      }
+      if (c > o) u = u.slice(0, -1);
+      else break;
+    }
+    u = u.replace(TRAIL_PUNCT, '');
+  } while (u !== prev);
+  return u;
+}
+
+// Extend a greedy URL match that reached the end of token ti across
+// following text-ish tokens. Returns {url, drop, tail, lits} or null if
+// no extension tokens follow. drop = following tokens fully consumed;
+// tail = leftover raw text of the first partially-consumed token (null
+// if the URL ends on a token boundary); lits = [[relOffset, raw]] for
+// following delimiter/escape tokens past the URL end, which become
+// literal text (the backpedal-trimmed tail is never emphasis).
+function spanUrl(toks, ti, ext0) {
+  let ext = ext0;
+  const segs = []; // [contribLen, token]
+  let k = ti + 1;
+  while (k < toks.length) {
+    const tk = toks[k];
+    if (typeof tk === 'string') {
+      const p = /^[^\s<]*/.exec(tk)[0].length;
+      if (p === 0) break;
+      segs.push([p, tk]);
+      ext += tk.slice(0, p);
+      if (p < tk.length) break;
+      k++;
+      continue;
+    }
+    if (typeof tk === 'object' && tk.t === 1) {
+      segs.push([tk.n, tk]);
+      ext += tk.c.repeat(tk.n);
+      k++;
+      continue;
+    }
+    if (typeof tk === 'object' && tk.t === 0) {
+      segs.push([2, tk]);
+      ext += '\\' + tk.s;
+      k++;
+      continue;
+    }
+    break;
+  }
+  if (segs.length === 0) return null;
+  const url = backpedal(ext);
+  let rem = url.length - ext0.length;
+  if (rem <= 0) return { url, drop: 0, tail: null, lits: [] };
+  let drop = 0, tail = null;
+  const lits = [];
+  for (let si = 0; si < segs.length; si++) {
+    const [len, tk] = segs[si];
+    if (rem >= len) { drop++; rem -= len; continue; }
+    if (rem > 0) {
+      if (typeof tk === 'string') tail = tk.slice(rem);
+      else if (tk.t === 1) tail = tk.c.repeat(tk.n - rem);
+      else tail = ('\\' + tk.s).slice(rem);
+      rem = 0;
+      // segments after the partial one become literal text
+      for (let sj = si + 1; sj < segs.length; sj++) {
+        const tk2 = segs[sj][1];
+        if (typeof tk2 !== 'string') lits.push([sj + 1, tk2.t === 1 ? tk2.c.repeat(tk2.n) : '\\' + tk2.s]);
+      }
+      break;
+    }
+    // rem === 0: this and later segments are past the URL end
+    if (typeof tk !== 'string') lits.push([si + 1, tk.t === 1 ? tk.c.repeat(tk.n) : '\\' + tk.s]);
+  }
+  return { url, drop, tail, lits };
+}
+
+// Split string tokens on www./http/email autolinks. Runs before processEm.
+// URL matches may span following delimiter/escape/text tokens (marked's
+// greedy tail swallows `*` etc.); email local parts may span preceding
+// delimiter tokens (`_foo@bar.com`).
+function linkifyTokens(toks) {
+  for (let ti = 0; ti < toks.length; ti++) {
+    const t = toks[ti];
+    if (typeof t !== 'string') continue;
+    const s = t;
+    let prevChar = '';
+    if (ti > 0) {
+      const p = toks[ti - 1];
+      if (typeof p === 'string') prevChar = p[p.length - 1];
+      else if (p.t === 1) prevChar = p.c;
+    }
+    let curPrev = prevChar, pos = 0, emitFrom = 0, found = false;
+    let backDrop = 0, fwdDrop = 0, fwdTail = null, fwdLits = [];
+    const segs = [];
+    while (pos < s.length) {
+      const w = s.indexOf('www.', pos);
+      const u = s.indexOf('://', pos);
+      const at = s.indexOf('@', pos);
+      let kind = 0, idx = -1;
+      if (w >= 0 && (idx < 0 || w < idx)) { kind = 1; idx = w; }
+      if (u >= 0 && (idx < 0 || u < idx)) { kind = 2; idx = u; }
+      if (at >= 0 && (idx < 0 || at < idx)) { kind = 3; idx = at; }
+      if (idx < 0) break;
+      if (kind === 1 || kind === 2) {
+        let start;
+        if (kind === 1) {
+          const pc = idx === emitFrom ? curPrev : s[idx - 1];
+          if (pc !== '' && !WWW_PREV_OK.has(pc)) { pos = idx + 4; continue; }
+          start = idx;
+        } else {
+          start = -1;
+          if (s.slice(idx - 5, idx) === 'https') start = idx - 5;
+          else if (s.slice(idx - 4, idx) === 'http') start = idx - 4;
+          else if (s.slice(idx - 3, idx) === 'ftp') start = idx - 3;
+          if (start < 0 || start < emitFrom) { pos = idx + 3; continue; }
+        }
+        URL_STICKY.lastIndex = start;
+        const m = URL_STICKY.exec(s);
+        if (!m) { pos = idx + (kind === 1 ? 4 : 3); continue; }
+        let url = backpedal(m[0]);
+        let endPos = start + url.length;
+        if (kind === 1 && url.length < 5) { pos = idx + 4; continue; }
+        if (start + m[0].length === s.length) {
+          const sp = spanUrl(toks, ti, m[0]);
+          if (sp) {
+            url = sp.url;
+            if (url.length > m[0].length) {
+              endPos = s.length;
+              fwdDrop = sp.drop;
+              fwdTail = sp.tail;
+              fwdLits = sp.lits;
+            } else {
+              endPos = start + url.length;
+            }
+          }
+        }
+        if (start > emitFrom) segs.push(s.slice(emitFrom, start));
+        const href = kind === 1 ? procHref('http://' + url) : procHref(url);
+        segs.push({ t: 10, href, text: url });
+        pos = emitFrom = endPos;
+        curPrev = ''; found = true;
+        continue;
+      }
+      // '@' — email: scan back for local-part start (not past emitFrom)
+      let ls = idx;
+      while (ls > emitFrom && EMAIL_LOCAL_CHARS.has(s[ls - 1])) ls--;
+      EMAIL_STICKY.lastIndex = ls;
+      const m = EMAIL_STICKY.exec(s);
+      if (!m || m.index + m[0].length <= idx) { pos = idx + 1; continue; }
+      let pre = '';
+      if (m.index === emitFrom && emitFrom === 0) {
+        let k = ti - 1;
+        while (k >= 0) {
+          const pk = toks[k];
+          if (typeof pk === 'object' && pk.t === 1 && EMAIL_LOCAL_CHARS.has(pk.c)) {
+            pre = pk.c.repeat(pk.n) + pre;
+            backDrop++;
+            k--;
+          } else break;
+        }
+      }
+      if (m.index > emitFrom) segs.push(s.slice(emitFrom, m.index));
+      const email = pre + m[0];
+      segs.push({ t: 10, href: procHref('mailto:' + email), text: email });
+      pos = emitFrom = m.index + m[0].length;
+      curPrev = ''; found = true;
+    }
+    if (!found) continue;
+    if (emitFrom < s.length) segs.push(s.slice(emitFrom));
+    if (backDrop > 0) { toks.splice(ti - backDrop, backDrop); ti -= backDrop; }
+    if (fwdDrop > 0) toks.splice(ti + 1, fwdDrop);
+    if (fwdTail !== null) toks[ti + 1] = fwdTail;
+    for (const [rel, raw] of fwdLits) toks[ti + rel - fwdDrop] = raw;
+    toks.splice(ti, 1, ...segs);
+    ti += segs.length - 1;
+  }
+}
+
 // ---------- inline core (index-based scan) ----------
 // Token kinds: string = text; {t:1} delimiter run; {t:2} code span;
 // {t:3} hard break; {t:5} em/strong node. Phase 2 adds links/images/etc.
@@ -827,7 +1296,7 @@ function isPunctCh(c) {
   return PUNCT_RE.test(c);
 }
 
-function inline(src, refs) {
+function inlineTokens(src, refs) {
   const toks = [];
   const n = src.length;
   let i = 0, start = 0;
@@ -842,7 +1311,7 @@ function inline(src, refs) {
         start = i; continue;
       }
       if (nx !== undefined && ASCII_PUNCT.has(nx)) {
-        flush(i); toks.push(nx); i += 2; start = i; continue;
+        flush(i); toks.push({ t: 0, s: nx }); i += 2; start = i; continue;
       }
       i++; continue;
     }
@@ -902,14 +1371,58 @@ function inline(src, refs) {
       }
       i++; continue;
     }
-    // __PHASE2_INLINE__: links, images, autolinks, email, strikethrough,
-    // inline HTML go here — dispatch cases for '[', '!', '<', '~' that
-    // flush the text run and push Phase 2 tokens.
+    if (cc === 91) { // '[' — link
+      const L = tryLink(src, i, refs, false);
+      if (L) {
+        flush(i);
+        toks.push({ t: 6, href: L.href, title: L.title, kids: L.kids });
+        i = L.end; start = i; continue;
+      }
+      i++; continue;
+    }
+    if (cc === 33 && src.charCodeAt(i + 1) === 91) { // '![' — image
+      const L = tryLink(src, i, refs, true);
+      if (L) {
+        flush(i);
+        toks.push({ t: 7, src: L.href, title: L.title, kids: L.kids });
+        i = L.end; start = i; continue;
+      }
+      i++; continue;
+    }
+    if (cc === 60) { // '<' — autolink or inline HTML
+      const A = tryAutolink(src, i);
+      if (A) {
+        flush(i);
+        toks.push({ t: 10, href: A.href, text: A.text });
+        i = A.end; start = i; continue;
+      }
+      const H = tryHtml(src, i);
+      if (H) {
+        flush(i);
+        toks.push({ t: 9, s: H.s });
+        i = H.end; start = i; continue;
+      }
+      i++; continue;
+    }
+    if (cc === 126) { // '~' — strikethrough
+      const D = tryDel(src, i, refs);
+      if (D) {
+        flush(i);
+        toks.push({ t: 8, kids: D.kids });
+        i = D.end; start = i; continue;
+      }
+      i++; continue;
+    }
     i++;
   }
   flush(n);
+  linkifyTokens(toks);
   processEm(toks);
-  return renderInline(toks);
+  return toks;
+}
+
+function inline(src, refs) {
+  return renderInline(inlineTokens(src, refs));
 }
 
 // CommonMark delimiter-stack emphasis, left-to-right over closers.
@@ -947,11 +1460,31 @@ function renderInline(toks) {
   let out = '';
   for (const t of toks) {
     if (typeof t === 'string') out += escText(t);
+    else if (t.t === 0) out += escText(t.s);
     else if (t.t === 1) out += t.c.repeat(t.n);
     else if (t.t === 2) out += '<code>' + escRaw(t.s) + '</code>';
     else if (t.t === 3) out += '<br>';
     else if (t.t === 5) out += '<' + t.tag + '>' + renderInline(t.kids) + '</' + t.tag + '>';
-    // __PHASE2_INLINE__: render Phase 2 token kinds here.
+    else if (t.t === 6) {
+      if (t.href === null) out += renderInline(t.kids);
+      else {
+        out += '<a href="' + escRaw(t.href) + '"';
+        if (t.title) out += ' title="' + escRaw(t.title) + '"';
+        out += '>' + renderInline(t.kids) + '</a>';
+      }
+    } else if (t.t === 7) {
+      if (t.src === null) out += renderInline(t.kids);
+      else {
+        out += '<img src="' + escRaw(t.src) + '" alt="' + stripTags(renderInline(t.kids)) + '"';
+        if (t.title) out += ' title="' + escRaw(t.title) + '"';
+        out += '>';
+      }
+    } else if (t.t === 8) out += '<del>' + renderInline(t.kids) + '</del>';
+    else if (t.t === 9) out += t.s;
+    else if (t.t === 10) {
+      if (t.href === null) out += escRaw(t.text);
+      else out += '<a href="' + escRaw(t.href) + '">' + escRaw(t.text) + '</a>';
+    }
   }
   return out;
 }
